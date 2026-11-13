@@ -24,7 +24,8 @@ final class SDROutdoorEngine: ObservableObject {
     private var wantsSdrpp = false
     var sdrppRequested: Bool { wantsSdrpp }
     private var reconnectTask: Task<Void, Never>?
-    private var timer: Timer?
+    private var refreshTask: Task<Void, Never>?
+    private var lastSatelliteRefresh = Date.distantPast
     private var initialized = false
     init() {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("SDR Outdoor", isDirectory: true)
@@ -48,6 +49,7 @@ final class SDROutdoorEngine: ObservableObject {
             refresh()
         }
         if satelliteRows.isEmpty { _ = command(["cmd":"sat_update"]); refresh() }
+        startRefreshLoop()
     }
     /// Keep the first launch useful when the network is unavailable. The Rust worker will
     /// replace these records with the current SatNOGS/Celestrak cache when an update succeeds.
@@ -65,22 +67,37 @@ final class SDROutdoorEngine: ObservableObject {
     func bootstrap() {
         ensureInitialized()
     }
+    private func startRefreshLoop() {
+        guard refreshTask == nil else { return }
+        refreshTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled {
+                let interval = self.status["running"] as? Bool == true ? 250 : 1_000
+                try? await Task.sleep(for: .milliseconds(interval))
+                guard !Task.isCancelled else { break }
+                self.refresh()
+            }
+        }
+    }
     @discardableResult func command(_ object: [String: Any]) -> [String: Any] {
         guard let data = try? JSONSerialization.data(withJSONObject: object), let json = String(data: data, encoding: .utf8), let pointer = json.withCString({ sdr_outdoor_apple_command($0) }) else { return ["ok": false, "error": "comando inválido"] }
         defer { sdr_outdoor_apple_string_free(pointer) }
         guard let data = String(cString: pointer).data(using: .utf8), let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ["ok": false, "error": "resposta inválida"] }
         if value["ok"] as? Bool == false { lastError = value["error"] as? String }; return value
     }
-    func refresh() {
+    func refresh(forceSatelliteData: Bool = false) {
         guard initialized else { return }
         status = command(["cmd":"status"])
-        let satellites = command(["cmd":"sat_list"])
-        satelliteRows = satellites["rows"] as? [[String: Any]] ?? []
-        detail = command(["cmd":"sat_detail"])
+        // Satellite list generation and orbital propagation are too expensive for the
+        // 4 Hz spectrum refresh on the main thread; update that data at most every 2 seconds.
+        if forceSatelliteData || Date().timeIntervalSince(lastSatelliteRefresh) >= 2 {
+            let satellites = command(["cmd":"sat_list"])
+            satelliteRows = satellites["rows"] as? [[String: Any]] ?? []
+            detail = command(["cmd":"sat_detail"])
+            lastSatelliteRefresh = Date()
+        }
         if status["running"] as? Bool != true {
             spectrum.removeAll()
             waterfall.removeAll()
-            if timer == nil { timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in Task { @MainActor in self?.refresh() } } }
             return
         }
         if let plugins = status["plugins"] as? [String: Any] { pluginPins = plugins["pins"] as? [[String: Any]] ?? [] }
@@ -108,7 +125,6 @@ final class SDROutdoorEngine: ObservableObject {
         }
         if let newest { spectrum = newest }
         if added > 0 && waterfall.count > 80 { waterfall.removeLast(waterfall.count - 80) }
-        if timer == nil { timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in Task { @MainActor in self?.refresh() } } }
     }
     private func loadSSTVImage() { let value = command(["cmd": "sstv_image", "current": true]); guard let width = value["width"] as? Int, let height = value["height"] as? Int, let encoded = value["rgb"] as? String, let rgb = Data(base64Encoded: encoded), width > 0, height > 0, rgb.count >= width * height * 3 else { return }; let provider = CGDataProvider(data: rgb as CFData); let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 24, bytesPerRow: width * 3, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue), provider: provider!, decode: nil, shouldInterpolate: false, intent: .defaultIntent); if let image { sstvImage = UIImage(cgImage: image) } }
     func setting(_ cmd: String, _ values: [String:Any] = [:]) { var object = values; object["cmd"] = cmd; _ = command(object); refresh() }
@@ -116,6 +132,10 @@ final class SDROutdoorEngine: ObservableObject {
     func recording(_ on: Bool) { let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].path; _ = command(["cmd": on ? "record_start" : "record_stop", "dir": dir]); refresh() }
     func decoder(_ name: String, on: Bool) { _ = command(["cmd": name, "on": on]); refresh() }
     func clearAPRS() { _ = command(["cmd": "aprs_clear"]); refresh() }
+    private func refreshSatelliteData() {
+        lastSatelliteRefresh = .distantPast
+        refresh(forceSatelliteData: true)
+    }
     func groundAprs(_ on: Bool, hz: Double? = nil) { var values: [String: Any] = ["on": on]; if let hz { values["hz"] = hz }; setting("ground_aprs", values) }
     func debugMode(_ on: Bool) { setting("debug_mode", ["on": on]) }
     func labPin(_ pin: String) { setting("lab_pin", ["pin": pin]) }
@@ -136,7 +156,7 @@ final class SDROutdoorEngine: ObservableObject {
         refresh()
     }
     func changeVolume(_ delta: Float) { volume = max(0, min(1, volume + delta)); audio.setVolume(volume) }
-    func start() { guard wantsSdrpp else { lastError = "Conecte ao SDR++ em Settings antes de iniciar o receptor."; return }; ensureInitialized(); _ = command(["cmd":"start"]); audio.start(); audio.setVolume(volume); refresh() }; func stop() { wantsSdrpp = false; reconnectTask?.cancel(); reconnectTask = nil; sdrppConnecting = false; ensureInitialized(); _ = command(["cmd":"stop"]); audio.stop(); spectrum.removeAll(); waterfall.removeAll(); refresh() }; func updateSatellites() { ensureInitialized(); _ = command(["cmd":"sat_update"]); refresh() }
+    func start() { guard wantsSdrpp else { lastError = "Conecte ao SDR++ em Settings antes de iniciar o receptor."; return }; ensureInitialized(); _ = command(["cmd":"start"]); audio.start(); audio.setVolume(volume); refresh() }; func stop() { wantsSdrpp = false; reconnectTask?.cancel(); reconnectTask = nil; sdrppConnecting = false; ensureInitialized(); _ = command(["cmd":"stop"]); audio.stop(); spectrum.removeAll(); waterfall.removeAll(); refresh() }; func updateSatellites() { ensureInitialized(); _ = command(["cmd":"sat_update"]); refreshSatelliteData() }
     func configureSdrpp(host: String, port: Int) {
         ensureInitialized()
         guard !wantsSdrpp else { return }
@@ -181,6 +201,6 @@ final class SDROutdoorEngine: ObservableObject {
         stop()
         lastError = nil
     }
-    func favourite(_ norad: Int, on: Bool) { _ = command(["cmd":"favourite", "norad": norad, "on": on]); refresh() }
-    func select(_ norad: Int, tx: String? = nil) { UserDefaults.standard.set(norad, forKey: "selectedNorad"); var object: [String: Any] = ["cmd":"sat_select", "norad":norad]; if let tx { object["tx"] = tx }; _ = command(object); refresh() }; func track(_ on: Bool) { _ = command(["cmd":"sat_track","on":on]); refresh() }; func setMode(_ mode: String) { UserDefaults.standard.set(mode, forKey: "mode"); _ = command(["cmd":"mode","mode":mode]); refresh() }; func setSource(_ id: String) { UserDefaults.standard.set(id, forKey: "source"); _ = command(["cmd":"source","id":id]); refresh() }
+    func favourite(_ norad: Int, on: Bool) { _ = command(["cmd":"favourite", "norad": norad, "on": on]); refreshSatelliteData() }
+    func select(_ norad: Int, tx: String? = nil) { UserDefaults.standard.set(norad, forKey: "selectedNorad"); var object: [String: Any] = ["cmd":"sat_select", "norad":norad]; if let tx { object["tx"] = tx }; _ = command(object); refreshSatelliteData() }; func track(_ on: Bool) { _ = command(["cmd":"sat_track","on":on]); refreshSatelliteData() }; func setMode(_ mode: String) { UserDefaults.standard.set(mode, forKey: "mode"); _ = command(["cmd":"mode","mode":mode]); refresh() }; func setSource(_ id: String) { UserDefaults.standard.set(id, forKey: "source"); _ = command(["cmd":"source","id":id]); refresh() }
 }
