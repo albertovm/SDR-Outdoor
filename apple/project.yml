@@ -1,0 +1,34 @@
+name: SatHunterApp
+options:
+  deploymentTarget:
+    iOS: "18.0"
+targets:
+  SatHunterApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: SatHunterApp
+    resources:
+      - path: SatHunterApp/Assets.xcassets
+    info:
+      path: SatHunterApp/Info.plist
+      properties:
+        CFBundleDisplayName: SDR Outdoor
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortraitUpsideDown
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.albertovm.sdroutdoor
+        SWIFT_VERSION: 6.0
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+        OTHER_LDFLAGS: "-lc++"
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+    dependencies:
+      - framework: Frameworks/SatHunterCore.xcframework
+        embed: false

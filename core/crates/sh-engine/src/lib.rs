@@ -1,0 +1,2171 @@
+//! SatHunterSDR engine: owns the source, the DSP thread, the satellite tracker and the settings.
+//! The UI (Android today, desktop later) talks to it with JSON commands and pulls spectrum rows
+//! and audio. Nothing in here panics on bad input; errors come back as {"ok": false, "error"}.
+
+#![recursion_limit = "256"]
+
+pub mod config;
+mod lab;
+mod plugins;
+pub mod record;
+pub mod sat;
+
+use config::Config;
+use sat::{Other, SatState};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sh_dsp::demod::{Demodulator, Mode};
+use sh_dsp::spectrum::Spectrum;
+use sh_sat::orbit::Station;
+use sh_sat::tracker::{demod_for, waiting_for_aos};
+use sh_sat::{locator, Filter};
+use sh_sources::demo::sat_slot;
+#[cfg(not(target_os = "ios"))]
+use sh_sources::demo::DemoSource;
+use sh_sources::{SatSignal, SharedSatSignal, SignalKind, Sink, Source};
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const AUDIO_MAX: usize = 48_000; // 1 s
+const AUDIO_PREROLL: usize = 12_000; // 250 ms absorbs network and DSP scheduling jitter
+const ROWS_MAX: usize = 64;
+
+pub fn now_unix() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// Lock that survives a panic in another thread (the data is still usable for a receiver).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What the DSP thread should do; `version` changes on every edit.
+#[derive(Debug, Clone)]
+struct DspParams {
+    version: u64,
+    mode: Mode,
+    bw: f64,
+    vfo_hz: f64,
+    /// Doppler tracking: the VFO moves on at this rate (Hz/s) from `vfo_at`, so the tone glides
+    /// between the control ticks instead of stepping (lab 2026-11-04: 24-35 Hz steps every 200 ms
+    /// at the closest point of a LEO pass broke the CW decoding)
+    vfo_rate: f64,
+    vfo_at: Instant,
+    fft_size: usize,
+    fps: f64,
+    squelch: Option<f32>,
+}
+
+#[derive(Debug, Default)]
+struct DspOut {
+    level_db: f32,
+    audio_rms: f32,
+    bins: usize,
+    center_hz: f64,
+    rate: f64,
+}
+
+enum Work {
+    Download,
+    Recalc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct UsbDev {
+    kind: &'static str,
+    vid: u16,
+    pid: u16,
+    fd: Option<i32>,
+    blog_v4: bool,
+}
+
+struct Inner {
+    devices: Mutex<Vec<UsbDev>>,
+    dir: PathBuf,
+    cfg: Mutex<Config>,
+    source: Mutex<Option<Box<dyn Source>>>,
+    params: Mutex<DspParams>,
+    out: Mutex<DspOut>,
+    /// FFT rows with the centre frequency and sample rate they were taken at
+    rows: Mutex<VecDeque<(f64, f64, Vec<f32>)>>,
+    audio: Mutex<VecDeque<f32>>,
+    audio_primed: AtomicBool,
+    audio_underruns: AtomicU64,
+    sat: Mutex<SatState>,
+    sat_signal: SharedSatSignal,
+    dsp_thread: Mutex<Option<JoinHandle<()>>>,
+    dropped: Mutex<Option<Arc<AtomicU64>>>,
+    running: AtomicBool,
+    /// Decimation the running source applies (1 = none): the span is rate / decim
+    decim: std::sync::atomic::AtomicUsize,
+    /// Update requests (lab link / UI): the app reacts when the counter changes
+    update_req: Mutex<(u64, bool)>,
+    /// APRS: the decoder (when on) and the frames decoded so far (total count, last ones)
+    aprs: Mutex<Option<sh_dsp::afsk::AfskDecoder>>,
+    aprs_frames: Mutex<(u64, VecDeque<Value>)>,
+    /// Decoder plugins, loaded on first use (lock after aprs / aprs_frames, never before)
+    plugins: Mutex<Option<plugins::Host>>,
+    /// SSTV: the decoder (when on) and the finished pictures (total count, the last few)
+    sstv: Mutex<Option<sh_dsp::sstv::SstvDecoder>>,
+    /// 9600 bd G3RUH decoder (its frames join the AX.25 list and the plugins)
+    fsk: Mutex<Option<sh_dsp::fsk9600::G3ruhDecoder>>,
+    sstv_pics: Mutex<(u64, VecDeque<sh_dsp::sstv::SstvImage>)>,
+    quit: AtomicBool,
+    time_shift: Mutex<(f64, f64)>, // (seconds added to the clock, LOS of the simulated pass)
+    work: Mutex<Sender<Work>>,
+    messages: Mutex<VecDeque<String>>,
+    /// IQ recording in progress
+    recorder: Mutex<Option<record::Recorder>>,
+    /// Lab link (debug mode): server state, and what the DSP hands it
+    lab: Mutex<Option<lab::Lab>>,
+    tap: Mutex<lab::Tap>,
+    lab_on: AtomicBool,
+}
+
+impl Inner {
+    fn sim_now(&self) -> f64 {
+        now_unix() + lock(&self.time_shift).0
+    }
+
+    fn note(&self, s: impl Into<String>) {
+        let s = s.into();
+        log::info!("{s}");
+        let mut m = lock(&self.messages);
+        m.push_back(s);
+        while m.len() > 200 {
+            m.pop_front();
+        }
+    }
+
+    fn save(&self) {
+        let c = lock(&self.cfg).clone();
+        c.save(&self.dir.join("config.json"));
+    }
+
+    fn bump_params(&self, f: impl FnOnce(&mut DspParams)) {
+        let mut p = lock(&self.params);
+        f(&mut p);
+        p.version += 1;
+    }
+}
+
+pub struct Engine {
+    inner: Arc<Inner>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum Cmd {
+    Start,
+    Stop,
+    /// Tune the VFO (absolute Hz); the hardware follows when needed
+    Tune { hz: f64 },
+    /// Hardware centre frequency
+    Center { hz: f64 },
+    Mode { mode: String, bw: Option<f64> },
+    Bandwidth { hz: f64 },
+    Gain { db: Option<f32> },
+    /// 4.5 V on the antenna input for an LNA (RTL-SDR)
+    BiasTee { on: bool },
+    /// Receiver frequency correction, ppm
+    Ppm { ppm: f64 },
+    /// Decimate the receiver stream by 1, 2, 4 or 8 (restarts the source)
+    Decimation { factor: usize },
+    Rate { hz: f64 },
+    Fft { size: usize },
+    Squelch { db: Option<f32> },
+    Station { lat: f64, lon: f64, alt_m: Option<f64> },
+    Locator { loc: String },
+    Gps { lat: f64, lon: f64, alt_m: f64 },
+    FollowGps { on: bool },
+    Filter { filter: Filter },
+    Favourite { norad: u64, on: bool },
+    SatUpdate,
+    SatSelect { norad: u64, tx: Option<String> },
+    SatTrack { on: bool },
+    SatResetOffset,
+    Simulate,
+    RealTime,
+    StepHz { hz: f64 },
+    AutoDemod { on: bool },
+    /// Keep the VFO in the middle: tuning moves the hardware (like SDR++ "Center Tuning")
+    CenterTuning { on: bool },
+    SatList,
+    SatDetail,
+    Status,
+    Messages,
+    Config,
+    /// Android: a USB SDR was plugged in and permitted (fd from UsbDeviceConnection)
+    UsbAttach { fd: Option<i32>, vid: u16, pid: u16, product: Option<String> },
+    UsbDetach { vid: u16, pid: u16 },
+    /// Choose the source: demo, rtl, esp
+    Source { id: String },
+    SdrppConfig { host: String, port: Option<u16> },
+    /// The file name a recording started now would get
+    RecordName,
+    /// Start recording IQ: into `dir` (a folder), or into `fd` (Android: an opened Downloads
+    /// entry, the engine takes it over); `name` as given by record_name
+    RecordStart { dir: Option<String>, fd: Option<i32>, name: Option<String> },
+    /// Stop recording; returns the metadata written into the file
+    RecordStop,
+    /// Debug mode on / off: the lab link on the LAN (remembered)
+    DebugMode { on: bool },
+    /// Lab link without changing the setting (tests)
+    LabStart { port: Option<u16> },
+    /// Fixed lab PIN (4-8 digits), empty = random each time
+    LabPin { pin: String },
+    LabStop,
+    /// APRS / AX.25 decoder (AFSK 1200 on the FM audio) on / off (remembered)
+    Aprs { on: bool },
+    /// Forget the decoded APRS frames
+    AprsClear,
+    /// Terrestrial APRS mode: on = Doppler tracking off, NFM 12.5 kHz on `hz` (default the last
+    /// one, 144.800 MHz), the APRS decoder on; off = back to the satellites (tracking on)
+    GroundAprs { on: bool, hz: Option<f64> },
+    /// Decoder plugins on / off
+    Plugins { on: bool },
+    /// Plugin output after number `since` (text lines, values, map pins)
+    PluginOut { since: Option<u64> },
+    /// SSTV decoder on / off
+    Sstv { on: bool },
+    /// 9600 bd G3RUH FSK decoder on / off
+    Fsk9k6 { on: bool },
+    /// A picture as base64 RGB: the one being received (`current`) or the last finished one
+    SstvImage { current: Option<bool> },
+    /// Ask the app to look for a newer release on GitHub and offer it (the app shows the
+    /// system install dialog; Android does not allow a silent install)
+    Update { prerelease: Option<bool> },
+}
+
+impl Engine {
+    pub fn new(dir: &Path) -> Engine {
+        let _ = std::fs::create_dir_all(dir);
+        let mut cfg = Config::load(&dir.join("config.json"));
+        #[cfg(target_os = "ios")]
+        if cfg.source == "demo" { cfg.source = "sdrpp".into(); }
+        let mode = Mode::parse(&cfg.mode).unwrap_or(Mode::Wfm);
+        let (wtx, wrx) = channel();
+        let inner = Arc::new(Inner {
+            dir: dir.to_path_buf(),
+            params: Mutex::new(DspParams {
+                version: 1,
+                mode,
+                bw: cfg.bw,
+                vfo_hz: cfg.vfo_hz,
+                vfo_rate: 0.0,
+                vfo_at: Instant::now(),
+                fft_size: cfg.fft_size,
+                fps: cfg.fps,
+                squelch: cfg.squelch,
+            }),
+            out: Mutex::new(DspOut::default()),
+            rows: Mutex::new(VecDeque::new()),
+            audio: Mutex::new(VecDeque::new()),
+            audio_primed: AtomicBool::new(false),
+            audio_underruns: AtomicU64::new(0),
+            sat: Mutex::new(SatState::default()),
+            sat_signal: sat_slot(),
+            source: Mutex::new(None),
+            dsp_thread: Mutex::new(None),
+            dropped: Mutex::new(None),
+            running: AtomicBool::new(false),
+            decim: std::sync::atomic::AtomicUsize::new(1),
+            update_req: Mutex::new((0, true)),
+            aprs: Mutex::new(None),
+            aprs_frames: Mutex::new((0, VecDeque::new())),
+            plugins: Mutex::new(None),
+            sstv: Mutex::new(None),
+            fsk: Mutex::new(None),
+            sstv_pics: Mutex::new((0, VecDeque::new())),
+            quit: AtomicBool::new(false),
+            time_shift: Mutex::new((0.0, 0.0)),
+            work: Mutex::new(wtx),
+            messages: Mutex::new(VecDeque::new()),
+            recorder: Mutex::new(None),
+            lab: Mutex::new(None),
+            tap: Mutex::new(lab::Tap::default()),
+            lab_on: AtomicBool::new(false),
+            devices: Mutex::new(Vec::new()),
+            cfg: Mutex::new(cfg),
+        });
+        {
+            let c = lock(&inner.cfg);
+            let mut s = lock(&inner.sat);
+            s.tracker.step_hz = c.step_hz;
+        }
+        let mut threads = Vec::new();
+        let i1 = inner.clone();
+        if let Ok(t) = std::thread::Builder::new().name("sat-worker".into()).spawn(move || sat_worker(i1, wrx)) {
+            threads.push(t);
+        }
+        let i2 = inner.clone();
+        if let Ok(t) = std::thread::Builder::new().name("control".into()).spawn(move || control(i2)) {
+            threads.push(t);
+        }
+        if lock(&inner.cfg).debug_mode {
+            if let Err(e) = lab::start(&inner, None) {
+                inner.note(e);
+            }
+        }
+        Engine { inner, threads }
+    }
+
+    /// Run a JSON command; always returns JSON.
+    pub fn command(&self, json: &str) -> String {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match serde_json::from_str::<Cmd>(json) {
+            Ok(c) => self.run(c),
+            Err(e) => Err(format!("bad command: {e}")),
+        }));
+        let v = match r {
+            Ok(Ok(v)) => {
+                let mut v = if v.is_object() { v } else { json!({ "value": v }) };
+                v["ok"] = json!(true);
+                v
+            }
+            Ok(Err(e)) => json!({ "ok": false, "error": e }),
+            Err(_) => json!({ "ok": false, "error": "internal error" }),
+        };
+        v.to_string()
+    }
+
+    /// Copy new spectrum rows (oldest first) into `out`, and each row's centre frequency and
+    /// sample rate into `meta` (2 values per row, when it has room). Returns (rows, bins per row).
+    pub fn spectrum_rows(&self, out: &mut [f32], meta: &mut [f64]) -> (usize, usize) {
+        let mut q = lock(&self.inner.rows);
+        let Some(bins) = q.front().map(|r| r.2.len()) else { return (0, 0) };
+        let mut n = 0;
+        while let Some((c, rate, r)) = q.front() {
+            if r.len() != bins || (n + 1) * bins > out.len() || (!meta.is_empty() && 2 * n + 2 > meta.len()) {
+                break;
+            }
+            out[n * bins..(n + 1) * bins].copy_from_slice(r);
+            if !meta.is_empty() {
+                meta[2 * n] = *c;
+                meta[2 * n + 1] = *rate;
+            }
+            q.pop_front();
+            n += 1;
+        }
+        if n == 0 && bins > out.len() {
+            q.pop_front(); // row larger than the caller's buffer: drop it
+        }
+        (n, bins)
+    }
+
+    /// Pull up to out.len() audio samples (48 kHz mono). Returns samples written.
+    pub fn audio(&self, out: &mut [f32]) -> usize {
+        let mut q = lock(&self.inner.audio);
+        if !self.inner.audio_primed.load(Ordering::Relaxed) {
+            if q.len() < AUDIO_PREROLL { return 0; }
+            self.inner.audio_primed.store(true, Ordering::Relaxed);
+        }
+        let n = out.len().min(q.len());
+        if n < out.len() && self.inner.running.load(Ordering::Relaxed) {
+            self.inner.audio_underruns.fetch_add(1, Ordering::Relaxed);
+            self.inner.audio_primed.store(false, Ordering::Relaxed);
+        }
+        for (o, s) in out.iter_mut().zip(q.drain(..n)) {
+            *o = s;
+        }
+        n
+    }
+
+    fn run(&self, c: Cmd) -> Result<Value, String> {
+        run_cmd(&self.inner, c)
+    }
+}
+
+/// Run one command (the JSON API: the app, the lab link).
+fn run_cmd(i: &Arc<Inner>, c: Cmd) -> Result<Value, String> {
+    match c {
+        Cmd::Start => {
+            start(i)?;
+            Ok(json!({}))
+        }
+        Cmd::Stop => {
+            stop(i);
+            Ok(json!({}))
+        }
+        Cmd::Tune { hz } => {
+            tune(i, hz)?;
+            i.save();
+            Ok(json!({ "vfo_hz": lock(&i.cfg).vfo_hz }))
+        }
+        Cmd::Center { hz } => {
+            let (min, max) = lock(&i.source).as_ref().map(|s| (s.info().min_hz, s.info().max_hz)).unwrap_or((0.0, f64::MAX));
+            let c = set_center(i, hz.clamp(min, max))?;
+            if lock(&i.cfg).center_tuning {
+                // Centre tuning: the VFO rides in the middle of the span
+                lock(&i.cfg).vfo_hz = c;
+                i.bump_params(|p| p.vfo_hz = c);
+                return Ok(json!({ "center_hz": c, "vfo_hz": c }));
+            }
+            // The VFO stays where it is unless it would leave the received span: then it is
+            // pushed along at the edge
+            let (rate, bw, vfo) = {
+                let cfg = lock(&i.cfg);
+                (cfg.rate, cfg.bw, cfg.vfo_hz)
+            };
+            let edge = (rate * 0.45 - bw / 2.0).max(rate * 0.05);
+            let v = vfo.clamp(c - edge, c + edge);
+            if v != vfo {
+                lock(&i.cfg).vfo_hz = v;
+                i.bump_params(|p| p.vfo_hz = v);
+            }
+            Ok(json!({ "center_hz": c, "vfo_hz": v }))
+        }
+        Cmd::Mode { mode, bw } => {
+            let m = Mode::parse(&mode).ok_or("unknown mode")?;
+            let (min_bw, max_bw) = m.bandwidth_limits();
+            let bw = bw.unwrap_or(m.default_bw()).clamp(min_bw, max_bw);
+            {
+                let mut c = lock(&i.cfg);
+                c.mode = m.name().into();
+                c.bw = bw;
+                c.auto_demod = false;
+            }
+            i.bump_params(|p| {
+                p.mode = m;
+                p.bw = bw;
+            });
+            lock(&i.audio).clear();
+            i.audio_primed.store(false, Ordering::Relaxed);
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::Bandwidth { hz } => {
+            let mode = Mode::parse(&lock(&i.cfg).mode).unwrap_or(Mode::Wfm);
+            let (min_bw, max_bw) = mode.bandwidth_limits();
+            let hz = hz.clamp(min_bw, max_bw);
+            lock(&i.cfg).bw = hz;
+            i.bump_params(|p| p.bw = hz);
+            lock(&i.audio).clear();
+            i.audio_primed.store(false, Ordering::Relaxed);
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::BiasTee { on } => {
+            lock(&i.cfg).bias_tee = on;
+            if let Some(s) = lock(&i.source).as_mut() {
+                if s.has_bias_tee() {
+                    s.set_bias_tee(on).map_err(|e| e.to_string())?;
+                }
+            }
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::Ppm { ppm } => {
+            let ppm = ppm.clamp(-200.0, 200.0);
+            lock(&i.cfg).ppm = ppm;
+            if let Some(s) = lock(&i.source).as_mut() {
+                s.set_ppm(ppm).map_err(|e| e.to_string())?;
+            }
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::Gain { db } => {
+            lock(&i.cfg).gain = db;
+            if let Some(s) = lock(&i.source).as_mut() {
+                s.set_gain(db).map_err(|e| e.to_string())?;
+            }
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::Decimation { factor } => {
+            let f = match factor {
+                0 | 1 => 1,
+                2 | 3 => 2,
+                4..=7 => 4,
+                _ => 8,
+            };
+            let was = i.running.load(Ordering::SeqCst);
+            if was {
+                stop(i);
+            }
+            lock(&i.cfg).decimation = f;
+            i.save();
+            if was {
+                start(i)?;
+            }
+            Ok(json!({ "factor": f }))
+        }
+        Cmd::Rate { hz } => {
+            let was = i.running.load(Ordering::SeqCst);
+            if was {
+                stop(i);
+            }
+            lock(&i.cfg).rate = hz;
+            i.save();
+            if was {
+                start(i)?;
+            }
+            Ok(json!({}))
+        }
+        Cmd::Fft { size } => {
+            let size = size.clamp(256, 16384).next_power_of_two().min(16384);
+            lock(&i.cfg).fft_size = size;
+            i.bump_params(|p| p.fft_size = size);
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::Squelch { db } => {
+            lock(&i.cfg).squelch = db;
+            i.bump_params(|p| p.squelch = db);
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::Station { lat, lon, alt_m } => {
+            set_station(i, lat, lon, alt_m);
+            Ok(json!({}))
+        }
+        Cmd::Locator { loc } => {
+            let (lat, lon) = locator::to_lat_lon(&loc).ok_or("bad locator")?;
+            set_station(i, lat, lon, None);
+            Ok(json!({ "lat": lat, "lon": lon }))
+        }
+        Cmd::Gps { lat, lon, alt_m } => {
+            let (follow, st) = {
+                let c = lock(&i.cfg);
+                (c.follow_gps, c.station)
+            };
+            // Recalculate only for a real move (200 m, 50 m height)
+            let dlat = (lat - st.lat) * 111.0;
+            let dlon = (lon - st.lon) * 111.0 * lat.to_radians().cos();
+            if follow && ((dlat * dlat + dlon * dlon).sqrt() > 0.2 || (alt_m - st.alt_m).abs() > 50.0) {
+                set_station(i, lat, lon, Some(alt_m));
+            }
+            Ok(json!({}))
+        }
+        Cmd::FollowGps { on } => {
+            lock(&i.cfg).follow_gps = on;
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::Filter { filter } => {
+            lock(&i.cfg).filter = filter;
+            i.save();
+            let _ = lock(&i.work).send(Work::Recalc);
+            Ok(json!({}))
+        }
+        Cmd::Favourite { norad, on } => {
+            {
+                let mut c = lock(&i.cfg);
+                if on {
+                    c.favourites.insert(norad);
+                } else {
+                    c.favourites.remove(&norad);
+                }
+            }
+            i.save();
+            let _ = lock(&i.work).send(Work::Recalc);
+            Ok(json!({}))
+        }
+        Cmd::SatUpdate => {
+            let _ = lock(&i.work).send(Work::Download);
+            Ok(json!({}))
+        }
+        Cmd::SatSelect { norad, tx } => {
+            select(i, norad, tx);
+            Ok(json!({}))
+        }
+        Cmd::SatTrack { on } => {
+            set_tracking(i, on);
+            Ok(json!({}))
+        }
+        Cmd::SatResetOffset => {
+            lock(&i.sat).tracker.reset();
+            Ok(json!({}))
+        }
+        Cmd::Simulate => {
+            simulate(i);
+            Ok(json!({}))
+        }
+        Cmd::RealTime => {
+            *lock(&i.time_shift) = (0.0, 0.0);
+            lock(&i.sat).tracker.reset();
+            let _ = lock(&i.work).send(Work::Recalc);
+            Ok(json!({}))
+        }
+        Cmd::StepHz { hz } => {
+            let hz = hz.clamp(1.0, 1000.0);
+            lock(&i.cfg).step_hz = hz;
+            lock(&i.sat).tracker.step_hz = hz;
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::CenterTuning { on } => {
+            lock(&i.cfg).center_tuning = on;
+            if on {
+                let v = lock(&i.cfg).vfo_hz;
+                tune(i, v)?;
+            }
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::AutoDemod { on } => {
+            lock(&i.cfg).auto_demod = on;
+            i.save();
+            Ok(json!({}))
+        }
+        Cmd::RecordName => Ok(json!({ "name": record_name(i) })),
+        Cmd::RecordStart { dir, fd, name } => record_start(i, dir, fd, name),
+        Cmd::RecordStop => record_stop(i, "stopped"),
+        Cmd::DebugMode { on } => {
+            lock(&i.cfg).debug_mode = on;
+            i.save();
+            if on {
+                lab::start(i, None)
+            } else {
+                lab::stop(i);
+                Ok(json!({ "on": false }))
+            }
+        }
+        Cmd::LabStart { port } => lab::start(i, port),
+        Cmd::LabPin { pin } => {
+            let pin = pin.trim().to_string();
+            if !pin.is_empty() && !lab::valid_pin(&pin) {
+                return Err("the PIN is 4 to 8 digits (empty: a random one each time)".into());
+            }
+            lock(&i.cfg).lab_pin = pin.clone();
+            i.save();
+            lab::set_pin(i, &pin);
+            Ok(lab::status(i))
+        }
+        Cmd::Aprs { on } => {
+            lock(&i.cfg).aprs = on;
+            i.save();
+            *lock(&i.aprs) = if on { Some(sh_dsp::afsk::AfskDecoder::new(sh_dsp::demod::AUDIO_RATE)) } else { None };
+            Ok(json!({ "aprs": on }))
+        }
+        Cmd::GroundAprs { on, hz } => {
+            ground_aprs(i, on, hz)?;
+            Ok(json!({ "ground_aprs": on, "hz": lock(&i.cfg).ground_aprs_hz }))
+        }
+        Cmd::AprsClear => {
+            *lock(&i.aprs_frames) = (0, VecDeque::new());
+            if let Some(h) = lock(&i.plugins).as_mut() {
+                h.out = (0, VecDeque::new());
+            }
+            Ok(json!({}))
+        }
+        Cmd::Plugins { on } => {
+            lock(&i.cfg).plugins = on;
+            i.save();
+            Ok(json!({ "plugins": on }))
+        }
+        Cmd::PluginOut { since } => Ok(plugin_out(i, since.unwrap_or(0))),
+        Cmd::Sstv { on } => {
+            lock(&i.cfg).sstv = on;
+            i.save();
+            *lock(&i.sstv) = if on { Some(sh_dsp::sstv::SstvDecoder::new(sh_dsp::demod::AUDIO_RATE)) } else { None };
+            Ok(json!({ "sstv": on }))
+        }
+        Cmd::Fsk9k6 { on } => {
+            lock(&i.cfg).fsk9k6 = on;
+            // 9600 bd needs a wider channel than voice: NFM at least 20 kHz
+            let widen = on && {
+                let c = lock(&i.cfg);
+                c.mode == "NFM" && c.bw < 20_000.0
+            };
+            if widen {
+                lock(&i.cfg).bw = 20_000.0;
+                i.bump_params(|p| p.bw = 20_000.0);
+            }
+            i.save();
+            if !on {
+                *lock(&i.fsk) = None;
+            }
+            Ok(json!({ "fsk9k6": on }))
+        }
+        Cmd::SstvImage { current } => sstv_image(i, current.unwrap_or(false)).map(|(img, n)| {
+            json!({ "n": n, "mode": img.mode.name(), "width": img.width, "height": img.height, "rows": img.rows, "rgb": base64(&img.rgb) })
+        }).ok_or_else(|| "no picture yet".to_string()),
+        Cmd::Update { prerelease } => {
+            let mut u = lock(&i.update_req);
+            u.0 += 1;
+            u.1 = prerelease.unwrap_or(true);
+            Ok(json!({ "update_req": u.0 }))
+        }
+        Cmd::LabStop => {
+            lab::stop(i);
+            Ok(json!({}))
+        }
+        Cmd::SatList => Ok(sat_list(i)),
+        Cmd::SatDetail => Ok(sat_detail(i)),
+        Cmd::Status => Ok(status(i)),
+        Cmd::Messages => Ok(json!({ "messages": lock(&i.messages).iter().cloned().collect::<Vec<_>>() })),
+        Cmd::Config => serde_json::to_value(lock(&i.cfg).clone()).map_err(|e| e.to_string()),
+        #[cfg(not(target_os = "ios"))]
+        Cmd::UsbAttach { fd, vid, pid, product } => {
+            let blog_v4 = product.as_deref().map(|p| p.contains("Blog V4")).unwrap_or(false);
+            let kind = if (vid, pid) == sh_sources::usb::ESP32S3_JTAG {
+                "esp"
+            } else if sh_sources::usb::is_rtl(vid, pid) {
+                "rtl"
+            } else {
+                return Err(format!("unknown USB device {vid:04x}:{pid:04x}"));
+            };
+            {
+                let mut d = lock(&i.devices);
+                d.retain(|x| x.kind != kind);
+                d.push(UsbDev { kind, vid, pid, fd, blog_v4 });
+            }
+            i.note(format!("USB: {kind} {vid:04x}:{pid:04x} {} plugged in", product.unwrap_or_default()));
+            if lock(&i.cfg).usb_autostart {
+                switch_source(i, kind)?;
+            }
+            Ok(json!({ "source": kind }))
+        }
+        #[cfg(target_os = "ios")]
+        Cmd::UsbAttach { .. } => Err("direct USB attachment is unavailable on iOS".into()),
+        #[cfg(not(target_os = "ios"))]
+        Cmd::UsbDetach { vid, pid } => {
+            let gone: Vec<UsbDev> = {
+                let mut d = lock(&i.devices);
+                let g = d.iter().filter(|x| x.vid == vid && x.pid == pid).cloned().collect();
+                d.retain(|x| !(x.vid == vid && x.pid == pid));
+                g
+            };
+            let cur = lock(&i.cfg).source.clone();
+            if gone.iter().any(|g| g.kind == cur) {
+                i.note(format!("USB: {cur} unplugged"));
+                stop(i);
+                if lock(&i.cfg).demo_when_no_device {
+                    switch_source(i, "demo")?;
+                }
+            }
+            Ok(json!({}))
+        }
+        #[cfg(target_os = "ios")]
+        Cmd::UsbDetach { .. } => Ok(json!({})),
+        Cmd::Source { id } => {
+            switch_source(i, &id)?;
+            Ok(json!({}))
+        }
+        Cmd::SdrppConfig { host, port } => {
+            let mut c = lock(&i.cfg);
+            c.sdrpp_host = host;
+            if let Some(p) = port { c.sdrpp_port = p; }
+            c.source = "sdrpp".into();
+            let host = c.sdrpp_host.clone(); let port = c.sdrpp_port;
+            drop(c);
+            let _ = (host, port);
+            switch_source(i, "sdrpp")?;
+            Ok(json!({ "host": lock(&i.cfg).sdrpp_host, "port": lock(&i.cfg).sdrpp_port }))
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        lab::stop(&self.inner);
+        stop(&self.inner);
+        self.inner.quit.store(true, Ordering::SeqCst);
+        // Wake the worker: a closed channel ends its loop
+        let (dead, _) = channel();
+        *lock(&self.inner.work) = dead;
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Source and tuning
+
+#[cfg(not(target_os = "ios"))]
+fn usb_id(i: &Inner, kind: &str) -> sh_sources::usb::UsbId {
+    let d = lock(&i.devices).iter().find(|d| d.kind == kind).copied();
+    match (d, kind) {
+        (Some(d), _) => sh_sources::usb::UsbId { vid: d.vid, pid: d.pid, fd: d.fd, blog_v4: d.blog_v4 },
+        // Desktop: found by vendor / product ID
+        (None, "esp") => sh_sources::usb::UsbId { vid: 0x303a, pid: 0x1001, fd: None, blog_v4: false },
+        (None, _) => sh_sources::usb::UsbId { vid: 0x0bda, pid: 0x2838, fd: None, blog_v4: false },
+    }
+}
+
+fn make_source(i: &Inner, id: &str) -> Result<Box<dyn Source>, String> {
+    match id {
+        #[cfg(not(target_os = "ios"))]
+        "demo" => Ok(Box::new(DemoSource::new(i.sat_signal.clone()))),
+        #[cfg(target_os = "ios")]
+        "demo" => Err("a fonte de demonstração não está disponível no iOS".into()),
+        "sdrpp" => { let c = lock(&i.cfg); Ok(Box::new(sh_sources::sdrpp::SdrppSource::new(c.sdrpp_host.clone(), c.sdrpp_port))) },
+        #[cfg(not(target_os = "ios"))]
+        "rtl" => Ok(Box::new(sh_sources::rtl::RtlSource::new(usb_id(i, "rtl")))),
+        #[cfg(not(target_os = "ios"))]
+        "esp" => Ok(Box::new(sh_sources::esp::EspSource::new(usb_id(i, "esp")))),
+        #[cfg(target_os = "ios")]
+        "rtl" | "esp" => Err("direct USB sources are unavailable on iOS; use demo or a network source".into()),
+        other => Err(format!("unknown source {other}")),
+    }
+}
+
+/// Change the source, keeping each source's own last frequency (the ESP-SDR only covers
+/// 2204-2804 MHz), and start it.
+fn switch_source(i: &Arc<Inner>, id: &str) -> Result<(), String> {
+    let info = make_source(i, id)?.info();
+    stop(i);
+    {
+        let mut c = lock(&i.cfg);
+        let old = c.source.clone();
+        let v = c.vfo_hz;
+        c.freqs.insert(old.clone(), v);
+        let def = if id == "esp" { 2_450_000_000.0 } else { 100_000_000.0 };
+        let mut f = if old == id { v } else { c.freqs.get(id).copied().unwrap_or(def) };
+        if !(info.min_hz..=info.max_hz).contains(&f) {
+            f = def;
+        }
+        c.source = id.to_string();
+        c.vfo_hz = f;
+        c.center_hz = if id == "sdrpp" { f } else { f - 0.2 * if info.sample_rates.contains(&c.rate) { c.rate } else { info.sample_rates[0] } };
+        c.center_hz = c.center_hz.clamp(info.min_hz, info.max_hz);
+        if !info.sample_rates.contains(&c.rate) {
+            c.rate = info.sample_rates[0];
+        }
+    }
+    let vfo = lock(&i.cfg).vfo_hz;
+    i.bump_params(|p| p.vfo_hz = vfo);
+    i.save();
+    start(i)
+}
+
+fn start(i: &Arc<Inner>) -> Result<(), String> {
+    if i.running.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let c = lock(&i.cfg).clone();
+    let mut src = make_source(i, &c.source)?;
+    let info = src.info();
+    let rate = if info.sample_rates.contains(&c.rate) { c.rate } else { info.sample_rates[0] };
+    src.set_sample_rate(rate).map_err(|e| e.to_string())?;
+    let center = if c.source == "sdrpp" { c.vfo_hz } else { c.center_hz }.clamp(info.min_hz, info.max_hz);
+    src.set_frequency(center).map_err(|e| e.to_string())?;
+    src.set_gain(c.gain).map_err(|e| e.to_string())?;
+    src.set_ppm(c.ppm).map_err(|e| e.to_string())?;
+    let decim = src.set_decimation(c.decimation).map_err(|e| e.to_string())?.max(1);
+    i.decim.store(decim, Ordering::SeqCst);
+    if src.has_bias_tee() {
+        src.set_bias_tee(c.bias_tee).map_err(|e| e.to_string())?;
+    }
+    let (sink, rx, dropped) = Sink::new(128);
+    src.start(sink).map_err(|e| e.to_string())?;
+    {
+        let mut cc = lock(&i.cfg);
+        cc.rate = rate;
+        cc.center_hz = center;
+    }
+    *lock(&i.source) = Some(src);
+    *lock(&i.dropped) = Some(dropped);
+    i.audio_primed.store(false, Ordering::Relaxed);
+    i.audio_underruns.store(0, Ordering::Relaxed);
+    i.running.store(true, Ordering::SeqCst);
+    let ii = i.clone();
+    let t = std::thread::Builder::new().name("dsp".into()).spawn(move || dsp(ii, rx)).map_err(|e| e.to_string())?;
+    *lock(&i.dsp_thread) = Some(t);
+    // The VFO must be inside the new span
+    let vfo = lock(&i.cfg).vfo_hz;
+    tune(i, vfo)?;
+    let d = if decim > 1 { format!(", decimation {decim} ({:.0} kS/s)", rate / decim as f64 / 1e3) } else { String::new() };
+    i.note(format!("started {} at {:.3} MHz, {:.3} MS/s{d}", info.name, center / 1e6, rate / 1e6));
+    Ok(())
+}
+
+fn stop(i: &Inner) {
+    let _ = record_stop(i, "receiver stopped");
+    i.running.store(false, Ordering::SeqCst);
+    if let Some(mut s) = lock(&i.source).take() {
+        s.stop();
+    }
+    if let Some(t) = lock(&i.dsp_thread).take() {
+        let _ = t.join();
+    }
+    lock(&i.audio).clear();
+    i.audio_primed.store(false, Ordering::Relaxed);
+    lock(&i.rows).clear();
+}
+
+fn set_center(i: &Inner, hz: f64) -> Result<f64, String> {
+    let actual = match lock(&i.source).as_mut() {
+        Some(s) => s.set_frequency(hz).map_err(|e| e.to_string())?,
+        None => hz,
+    };
+    lock(&i.cfg).center_hz = actual;
+    Ok(actual)
+}
+
+/// Tune the VFO. If it would leave the usable span, move the hardware so the signal sits a
+/// little away from the DC spike.
+fn tune(i: &Inner, hz: f64) -> Result<(), String> {
+    if lock(&i.cfg).source == "sdrpp" {
+        let center = set_center(i, hz)?;
+        lock(&i.audio).clear();
+        i.audio_primed.store(false, Ordering::Relaxed);
+        lock(&i.cfg).vfo_hz = center;
+        i.bump_params(|p| {
+            p.vfo_hz = center;
+            p.vfo_rate = 0.0;
+            p.vfo_at = Instant::now();
+        });
+        lock(&i.rows).clear();
+        return Ok(());
+    }
+    let (center, rate, bw, centered) = {
+        let c = lock(&i.cfg);
+        // the span the DSP sees: the hardware rate over the decimation
+        (c.center_hz, c.rate / i.decim.load(Ordering::SeqCst).max(1) as f64, c.bw, c.center_tuning)
+    };
+    if centered {
+        let c = set_center(i, hz)?;
+        lock(&i.cfg).vfo_hz = c;
+        i.bump_params(|p| p.vfo_hz = c);
+        return Ok(());
+    }
+    let edge = rate * 0.45 - bw / 2.0;
+    if (hz - center).abs() > edge.max(rate * 0.05) {
+        set_center(i, hz - 0.2 * rate)?;
+    }
+    lock(&i.cfg).vfo_hz = hz;
+    i.bump_params(|p| {
+        p.vfo_hz = hz;
+        p.vfo_rate = 0.0;
+        p.vfo_at = Instant::now();
+    });
+    Ok(())
+}
+
+/// Doppler tracking, every control tick: the DSP's VFO goes to the exact target and glides on at
+/// `rate` Hz/s until the next tick. (The configured VFO, which the UI shows and which tells the
+/// tracker that the user moved it, still steps by the tracker's step.)
+fn set_glide(i: &Inner, hz: f64, rate: f64) {
+    i.bump_params(|p| {
+        p.vfo_hz = hz;
+        p.vfo_rate = rate;
+        p.vfo_at = Instant::now();
+    });
+}
+
+fn dsp(i: Arc<Inner>, rx: Receiver<sh_sources::Block>) {
+    let mut ver = 0;
+    let mut p = lock(&i.params).clone();
+    let mut spec: Option<(Spectrum, f64, usize)> = None;
+    let mut demod: Option<(Demodulator, f64, Mode, f64)> = None;
+    let mut audio = Vec::with_capacity(4096);
+    while i.running.load(Ordering::SeqCst) {
+        let b = match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(b) => b,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        {
+            let lp = lock(&i.params);
+            if lp.version != ver {
+                ver = lp.version;
+                p = lp.clone();
+            }
+        }
+        // Rendering every IQ sample at network rates competes with the audio demodulator.
+        // Analyse fewer complete FFT windows while preserving the full frequency span.
+        let spectrum_stride = if b.rate >= 500_000.0 { 4 } else { 1 };
+        if !matches!(&spec, Some((_, r, n)) if *r == b.rate && *n == p.fft_size) {
+            spec = Some((Spectrum::new(p.fft_size, b.rate, p.fps * spectrum_stride as f64, 0.4), b.rate, p.fft_size));
+        }
+        {
+            let mut rec = lock(&i.recorder);
+            let changed = matches!(rec.as_ref(), Some(r) if r.rate != b.rate);
+            if changed {
+                if let Some(r) = rec.as_mut() {
+                    if r.adopt_rate_if_empty(b.rate) {
+                        // Continue with the first effective-rate block.
+                        continue;
+                    }
+                }
+                // a new sample rate / decimation cannot go on in the same file
+                if let Some(r) = rec.take() {
+                    let name = r.name.clone();
+                    let _ = r.finish(json!({ "end": "sample rate changed" }));
+                    i.note(format!("recording {name} closed: the sample rate changed"));
+                }
+            } else if let Some(r) = rec.as_mut() {
+                let sat = {
+                    let sel = lock(&i.cfg).selected;
+                    sel.and_then(|n| lock(&i.sat).sats.iter().find(|s| s.norad == n).map(|s| (n, s.name.clone())))
+                };
+                r.push(&b.samples, b.center_hz, p.vfo_hz, sat);
+            }
+        }
+        let glide = if p.vfo_rate != 0.0 { p.vfo_rate * p.vfo_at.elapsed().as_secs_f64().min(1.0) } else { 0.0 };
+        let offset = p.vfo_hz + glide - b.center_hz;
+        if !matches!(&demod, Some((_, r, m, bw)) if *r == b.rate && *m == p.mode && *bw == p.bw) {
+            demod = Some((Demodulator::new(p.mode, b.rate, offset, p.bw), b.rate, p.mode, p.bw));
+        }
+        let mut new_rows = Vec::new();
+        if let Some((s, _, _)) = spec.as_mut() {
+            s.push_sparse(&b.samples, spectrum_stride, |f| new_rows.push(f.to_vec()));
+            if i.lab_on.load(Ordering::Relaxed) && !new_rows.is_empty() {
+                lab::feed(&i, b.center_hz, b.rate, &new_rows, &[]);
+            }
+            if !new_rows.is_empty() {
+                let mut q = lock(&i.rows);
+                for r in new_rows {
+                    q.push_back((b.center_hz, b.rate, r));
+                }
+                while q.len() > ROWS_MAX {
+                    q.pop_front();
+                }
+            }
+        }
+        if let Some((d, _, _, _)) = demod.as_mut() {
+            if (d.offset() - offset).abs() > 0.5 {
+                d.set_offset(offset);
+            }
+            d.squelch_db = p.squelch;
+            audio.clear();
+            d.process(&b.samples, &mut audio);
+            if i.lab_on.load(Ordering::Relaxed) {
+                lab::feed(&i, b.center_hz, b.rate, &[], &audio);
+                lab::feed_fm(&i, d.fm_raw(), d.channel_rate());
+            }
+            aprs_feed(&i, &audio, p.vfo_hz);
+            sstv_feed(&i, &audio);
+            fsk_feed(&i, d.fm_raw(), d.channel_rate(), p.vfo_hz);
+            let mut q = lock(&i.audio);
+            q.extend(audio.iter());
+            while q.len() > AUDIO_MAX {
+                q.pop_front();
+            }
+            let mut o = lock(&i.out);
+            o.level_db = d.level_db();
+            o.audio_rms = if audio.is_empty() { 0.0 } else { (audio.iter().map(|v| v * v).sum::<f32>() / audio.len() as f32).sqrt() };
+            o.bins = p.fft_size;
+            o.center_hz = b.center_hz;
+            o.rate = b.rate;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// IQ recording
+
+fn record_name(i: &Inner) -> String {
+    let c = {
+        let o = lock(&i.out);
+        if o.center_hz > 0.0 { o.center_hz } else { lock(&i.cfg).center_hz }
+    };
+    record::file_name(c, now_unix())
+}
+
+fn record_start(i: &Inner, dir: Option<String>, fd: Option<i32>, name: Option<String>) -> Result<Value, String> {
+    // Take the descriptor over first, so it is closed on any error below
+    #[cfg(unix)]
+    let fd_file = fd.map(|fd| {
+        use std::os::fd::FromRawFd;
+        // SAFETY: the app detached this descriptor for us; we own and close it
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    });
+    #[cfg(not(unix))]
+    let fd_file: Option<std::fs::File> = fd.and(None);
+    if lock(&i.recorder).is_some() {
+        return Err("already recording".into());
+    }
+    let (center, rate) = {
+        let o = lock(&i.out);
+        (o.center_hz, o.rate)
+    };
+    if !i.running.load(Ordering::SeqCst) || rate <= 0.0 {
+        return Err("start the receiver first".into());
+    }
+    let name = name.unwrap_or_else(|| record::file_name(center, now_unix()));
+    let file: std::fs::File = match (fd_file, dir) {
+        (Some(f), _) => f,
+        (_, Some(d)) => {
+            std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            std::fs::File::create(Path::new(&d).join(&name)).map_err(|e| e.to_string())?
+        }
+        _ => return Err("no place to write the recording".into()),
+    };
+    let c = lock(&i.cfg).clone();
+    let sat = {
+        let st = lock(&i.sat);
+        c.selected.and_then(|n| st.sats.iter().find(|s| s.norad == n).map(|s| json!({ "norad": n, "name": s.name })))
+    };
+    let tx = selected_tx(i).map(|t| json!({ "description": t.description, "mode": t.mode, "downlink_low": t.down_low, "downlink_high": t.down_high }));
+    let meta = json!({
+        "app": concat!("SatHunterSDR ", env!("CARGO_PKG_VERSION")),
+        "start_unix": now_unix(),
+        "sample_rate": rate,
+        "center_hz": center,
+        "format": "IQ, 2 x 16-bit PCM, I left, Q right",
+        "source": c.source,
+        "source_status": lock(&i.source).as_ref().map(|s| s.status()).unwrap_or_default(),
+        "hardware_rate": c.rate,
+        "decimation": c.decimation,
+        "gain_db": c.gain,
+        "ppm": c.ppm,
+        "bias_tee": c.bias_tee,
+        "vfo_hz": c.vfo_hz,
+        "mode": c.mode,
+        "bandwidth_hz": c.bw,
+        "station": c.station,
+        "satellite": sat,
+        "transmitter": tx,
+        "tracking": lock(&i.sat).tracking,
+    });
+    let r = record::Recorder::start(file, name.clone(), rate, center, now_unix(), meta).map_err(|e| e.to_string())?;
+    *lock(&i.recorder) = Some(r);
+    i.note(format!("recording IQ to {name}"));
+    Ok(json!({ "name": name }))
+}
+
+fn record_stop(i: &Inner, why: &str) -> Result<Value, String> {
+    let Some(r) = lock(&i.recorder).take() else { return Ok(json!({ "recording": false })) };
+    let name = r.name.clone();
+    let (vfo, mode, offset) = {
+        let c = lock(&i.cfg);
+        (c.vfo_hz, c.mode.clone(), lock(&i.sat).tracker.user_offset)
+    };
+    let meta = r.finish(json!({ "end_unix": now_unix(), "end": why, "vfo_hz_at_end": vfo, "mode_at_end": mode, "tracker_offset_hz": offset }))?;
+    i.note(format!("recording {name} saved, {:.1} s", meta["duration_s"].as_f64().unwrap_or(0.0)));
+    Ok(json!({ "name": name, "meta": meta }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Satellites
+
+fn set_station(i: &Inner, lat: f64, lon: f64, alt_m: Option<f64>) {
+    {
+        let mut c = lock(&i.cfg);
+        c.station.lat = lat.clamp(-90.0, 90.0);
+        c.station.lon = lon.clamp(-180.0, 180.0);
+        if let Some(a) = alt_m {
+            c.station.alt_m = a;
+        }
+    }
+    i.save();
+    let _ = lock(&i.work).send(Work::Recalc);
+}
+
+fn select(i: &Inner, norad: u64, tx: Option<String>) {
+    let (sats, filter) = (lock(&i.sat).sats.clone(), lock(&i.cfg).filter.clone());
+    let Some(s) = sats.iter().find(|s| s.norad == norad) else { return };
+    let tx = tx.or_else(|| s.tx.iter().find(|t| filter.tx_matches(t)).or(s.tx.first()).map(|t| t.uuid.clone()));
+    {
+        let mut c = lock(&i.cfg);
+        c.selected = Some(norad);
+        c.selected_tx = tx;
+    }
+    {
+        let mut st = lock(&i.sat);
+        st.sel_pass = None;
+        st.track = None;
+        st.tracker.reset();
+    }
+    i.save();
+    let _ = lock(&i.work).send(Work::Recalc);
+    set_tracking(i, true);
+}
+
+fn ground_aprs(i: &Inner, on: bool, hz: Option<f64>) -> Result<(), String> {
+    {
+        let mut c = lock(&i.cfg);
+        c.ground_aprs = on;
+        if let Some(h) = hz.filter(|h| (50e6..1.3e9).contains(h)) {
+            c.ground_aprs_hz = h;
+        }
+        if on {
+            c.aprs = true;
+        }
+    }
+    if on {
+        set_tracking(i, false);
+        let hz = lock(&i.cfg).ground_aprs_hz;
+        let bw = 12_500.0;
+        {
+            let mut c = lock(&i.cfg);
+            c.mode = Mode::Nfm.name().into();
+            c.bw = bw;
+        }
+        i.bump_params(|p| {
+            p.mode = Mode::Nfm;
+            p.bw = bw;
+        });
+        if lock(&i.aprs).is_none() {
+            *lock(&i.aprs) = Some(sh_dsp::afsk::AfskDecoder::new(sh_dsp::demod::AUDIO_RATE));
+        }
+        tune(i, hz)?;
+    } else if lock(&i.cfg).selected.is_some() {
+        set_tracking(i, true);
+    }
+    i.save();
+    Ok(())
+}
+
+fn set_tracking(i: &Inner, on: bool) {
+    if on {
+        // a satellite again: the terrestrial APRS mode ends
+        lock(&i.cfg).ground_aprs = false;
+    }
+    let auto = lock(&i.cfg).auto_demod;
+    {
+        let mut st = lock(&i.sat);
+        st.tracking = on;
+        st.tracker.reset();
+    }
+    if on && auto {
+        if let Some(t) = selected_tx(i) {
+            let (d, bw) = demod_for(&t);
+            let m = match d {
+                sh_sat::tracker::Demod::Nfm => Mode::Nfm,
+                sh_sat::tracker::Demod::Wfm => Mode::Wfm,
+                sh_sat::tracker::Demod::Am => Mode::Am,
+                sh_sat::tracker::Demod::Usb => Mode::Usb,
+                sh_sat::tracker::Demod::Lsb => Mode::Lsb,
+                sh_sat::tracker::Demod::Cw => Mode::Cw,
+            };
+            {
+                let mut c = lock(&i.cfg);
+                c.mode = m.name().into();
+                c.bw = bw;
+            }
+            i.bump_params(|p| {
+                p.mode = m;
+                p.bw = bw;
+            });
+        }
+    }
+}
+
+fn selected_tx(i: &Inner) -> Option<sh_sat::Transmitter> {
+    let (sel, tx) = {
+        let c = lock(&i.cfg);
+        (c.selected?, c.selected_tx.clone())
+    };
+    let sats = lock(&i.sat).sats.clone();
+    let s = sats.iter().find(|s| s.norad == sel)?;
+    match tx {
+        Some(u) => s.tx.iter().find(|t| t.uuid == u).cloned(),
+        None => s.tx.first().cloned(),
+    }
+}
+
+fn simulate(i: &Inner) {
+    let pass = lock(&i.sat).sel_pass;
+    let Some(p) = pass else { return };
+    if p.always {
+        return;
+    }
+    let now = i.sim_now();
+    if p.aos <= now {
+        return;
+    }
+    {
+        let mut ts = lock(&i.time_shift);
+        ts.0 += p.aos - 10.0 - now;
+        ts.1 = p.los;
+    }
+    lock(&i.sat).tracker.reset();
+    let _ = lock(&i.work).send(Work::Recalc);
+}
+
+fn load_cache(i: &Inner) -> usize {
+    let raw = sat::read_cache(&i.dir);
+    match sh_sat::db::load(&raw) {
+        Ok((sats, stats)) => {
+            let n = sats.len();
+            let mut s = lock(&i.sat);
+            s.sats = Arc::new(sats);
+            s.stats = stats;
+            s.status.clear();
+            n
+        }
+        Err(e) => {
+            lock(&i.sat).status = e.to_string();
+            0
+        }
+    }
+}
+
+fn sat_worker(i: Arc<Inner>, rx: Receiver<Work>) {
+    load_cache(&i);
+    let age = sat::cache_age_hours(&i.dir);
+    let days = lock(&i.cfg).update_days;
+    let mut pending_download = age.is_none() || (days > 0.0 && age.unwrap_or(0.0) > days * 24.0);
+    let mut pending_calc = true;
+    while !i.quit.load(Ordering::SeqCst) {
+        if pending_download {
+            pending_download = false;
+            lock(&i.sat).busy = true;
+            let ii = i.clone();
+            let err = sat::download(&i.dir, |f| lock(&ii.sat).status = format!("Downloading {f} ..."));
+            let n = load_cache(&i);
+            {
+                let mut s = lock(&i.sat);
+                s.busy = false;
+                if !err.is_empty() {
+                    s.status = format!("Update failed: {err}{}", if n > 0 { " (using the old data)" } else { "" });
+                }
+            }
+            i.note(format!("satellite data: {n} satellites{}", if err.is_empty() { String::new() } else { format!(", {err}") }));
+            pending_calc = true;
+        }
+        if pending_calc {
+            pending_calc = false;
+            recalc(&i);
+        }
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Work::Download) => pending_download = true,
+            Ok(Work::Recalc) => pending_calc = true,
+            Err(RecvTimeoutError::Timeout) => pending_calc = true, // passes move on: refresh every minute
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // Merge queued requests
+        while let Ok(w) = rx.try_recv() {
+            match w {
+                Work::Download => pending_download = true,
+                Work::Recalc => pending_calc = true,
+            }
+        }
+    }
+}
+
+fn recalc(i: &Arc<Inner>) {
+    let (filter, favs, st, sel) = {
+        let c = lock(&i.cfg);
+        (c.filter.clone(), c.favourites.clone(), c.station, c.selected)
+    };
+    let sats = lock(&i.sat).sats.clone();
+    let now = i.sim_now();
+    let cand = sat::candidates(&sats, &filter, &favs);
+    {
+        let mut s = lock(&i.sat);
+        s.calc_total = cand.len();
+        s.calc_done = 0;
+    }
+    let mut rows = Vec::new();
+    let mut last_pub = std::time::Instant::now();
+    for (k, (idx, mut r)) in cand.into_iter().enumerate() {
+        if i.quit.load(Ordering::SeqCst) {
+            return;
+        }
+        let min_el = if r.fav { 0.0 } else { filter.min_el };
+        if let Some(p) = sat::compute_pass(&sats[idx], &st, now, min_el) {
+            r.pass = p;
+            rows.push(r);
+        }
+        if last_pub.elapsed() > Duration::from_millis(500) {
+            let mut snap = rows.clone();
+            sat::sort_rows(&mut snap, now, filter.sort);
+            let mut s = lock(&i.sat);
+            s.rows = Arc::new(snap);
+            s.calc_done = k + 1;
+            last_pub = std::time::Instant::now();
+        }
+    }
+    sat::sort_rows(&mut rows, now, filter.sort);
+    // Selected satellite: its next pass (any elevation) and the radar track
+    let (mut sel_pass, mut trk) = (None, None);
+    if let Some(n) = sel {
+        if let Some(s) = sats.iter().find(|s| s.norad == n) {
+            sel_pass = sat::compute_pass(s, &st, now, 0.0);
+            trk = sel_pass.as_ref().map(|p| sat::make_track(s, &st, p));
+        }
+    }
+    let mut s = lock(&i.sat);
+    s.rows = Arc::new(rows);
+    s.calc_done = s.calc_total;
+    s.calc_total = 0;
+    s.sel_pass = sel_pass;
+    s.track = trk;
+    s.last_calc = now;
+}
+
+/// 5 Hz: Doppler tracking, the demo source's satellite signal, satellites overhead.
+fn control(i: Arc<Inner>) {
+    let mut tick = 0u64;
+    while !i.quit.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
+        tick += 1;
+        let now = i.sim_now();
+        // Back to real time after a simulated pass
+        let sim_los = lock(&i.time_shift).1;
+        if sim_los > 0.0 && now > sim_los + 30.0 {
+            *lock(&i.time_shift) = (0.0, 0.0);
+            let _ = lock(&i.work).send(Work::Recalc);
+            i.note("simulated pass over, back to real time");
+            continue;
+        }
+        let (sel, st, vfo) = {
+            let c = lock(&i.cfg);
+            (c.selected, c.station, c.vfo_hz)
+        };
+        // tracking off (or no satellite): no glide, the DSP back on the configured VFO
+        if !lock(&i.sat).tracking && lock(&i.params).vfo_rate != 0.0 {
+            i.bump_params(|p| {
+                p.vfo_rate = 0.0;
+                p.vfo_hz = vfo;
+            });
+        }
+        let sats = lock(&i.sat).sats.clone();
+        let sat = sel.and_then(|n| sats.iter().find(|s| s.norad == n));
+        let tx = selected_tx(&i);
+        let mut signal = None;
+        if let (Some(s), Some(t)) = (sat, tx.as_ref()) {
+            if let Ok(look) = s.orbit.look(&st, now) {
+                let pass = lock(&i.sat).sel_pass;
+                let aos_look = if waiting_for_aos(look.el, pass.as_ref(), now) {
+                    pass.and_then(|p| s.orbit.look(&st, p.aos).ok())
+                } else {
+                    None
+                };
+                let (retune, rate) = {
+                    let mut sst = lock(&i.sat);
+                    if sst.tracking {
+                        // Doppler rate from the look one second on (0 while waiting for AOS)
+                        let rate = if aos_look.is_none() {
+                            s.orbit.look(&st, now + 1.0).ok().map(|l1| sst.tracker.target(t.centre(), &l1, None) - sst.tracker.target(t.centre(), &look, None)).unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        let step = sst.tracker.step(t.centre(), &look, aos_look.as_ref(), vfo);
+                        (step, aos_look.is_none().then(|| (sst.tracker.target(t.centre(), &look, None), rate)))
+                    } else {
+                        (None, None)
+                    }
+                };
+                if let Some(f) = retune {
+                    if let Err(e) = tune(&i, f) {
+                        i.note(format!("tracking: {e}"));
+                        lock(&i.sat).tracking = false;
+                    }
+                }
+                if let Some((f, r)) = rate {
+                    set_glide(&i, f, r);
+                }
+                let kind = {
+                    let m = t.mode.to_uppercase();
+                    if t.is_linear() || m == "USB" || m == "LSB" || m == "SSB" {
+                        SignalKind::Linear
+                    } else if m == "CW" {
+                        SignalKind::Cw
+                    } else if m == "FM" || m == "FMN" {
+                        SignalKind::Fm
+                    } else {
+                        SignalKind::Data
+                    }
+                };
+                signal = Some(SatSignal {
+                    freq: sh_sat::doppler(t.centre(), look.range_rate_kms),
+                    width: if t.is_linear() { t.down_high - t.down_low } else { 0.0 },
+                    baud: t.baud,
+                    elevation: look.el,
+                    range_km: look.range_km,
+                    kind,
+                });
+            }
+        }
+        *lock(&i.sat_signal) = signal;
+        // Satellites overhead now (for the radar), once a second
+        if tick % 5 == 0 {
+            let rows = lock(&i.sat).rows.clone();
+            let mut others = Vec::new();
+            for r in rows.iter() {
+                if others.len() >= 12 {
+                    break;
+                }
+                if Some(r.norad) == sel || r.pass.aos > now || (r.pass.los < now && !r.pass.always) {
+                    continue;
+                }
+                if let Some(s) = sats.iter().find(|s| s.norad == r.norad) {
+                    if let Ok(l) = s.orbit.look(&st, now) {
+                        if l.el > 0.0 {
+                            others.push(Other { name: r.name.chars().take(10).collect(), az: l.az, el: l.el });
+                        }
+                    }
+                }
+            }
+            lock(&i.sat).others = others;
+            // Downlinks in the span the spectrum shows, for the labels on it
+            let (c, r) = {
+                let o = lock(&i.out);
+                (o.center_hz, o.rate)
+            };
+            let m = if r > 0.0 && i.running.load(Ordering::SeqCst) {
+                sat::markers(&sats, &st, now, c - r / 2.0, c + r / 2.0, sel, 40)
+            } else {
+                Vec::new()
+            };
+            lock(&i.sat).markers = m;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reports for the UI
+
+fn status(i: &Inner) -> Value {
+    let c = lock(&i.cfg).clone();
+    let audio_buffered_ms = lock(&i.audio).len() * 1000 / 48_000;
+    let o = lock(&i.out);
+    let dropped = lock(&i.dropped).as_ref().map(|d| d.load(Ordering::Relaxed)).unwrap_or(0);
+    let (shift, _) = *lock(&i.time_shift);
+    json!({
+        "running": i.running.load(Ordering::SeqCst),
+        "source": c.source,
+        "center_hz": c.center_hz,
+        "vfo_hz": c.vfo_hz,
+        "center_tuning": c.center_tuning,
+        "bias_tee": c.bias_tee,
+        "ppm": c.ppm,
+        "decimation": c.decimation,
+        "has_bias_tee": c.source == "rtl",
+        "rate": c.rate,
+        "mode": c.mode,
+        "bw": c.bw,
+        "gain": c.gain,
+        "squelch": c.squelch,
+        "level_db": o.level_db,
+        "audio_rms": o.audio_rms,
+        "audio_buffered_ms": audio_buffered_ms,
+        "audio_underruns": i.audio_underruns.load(Ordering::Relaxed),
+        "bins": if o.bins > 0 { o.bins } else { c.fft_size },
+        "spectrum_center_hz": o.center_hz,
+        "spectrum_rate": o.rate,
+        "dropped": dropped,
+        "source_status": lock(&i.source).as_ref().map(|s| s.status()).unwrap_or_default(),
+        "source_name": lock(&i.source).as_ref().map(|s| s.info().name).unwrap_or_default(),
+        "devices": lock(&i.devices).iter().map(|d| d.kind).collect::<Vec<_>>(),
+        "source_rates": lock(&i.source).as_ref().map(|s| s.info().sample_rates).unwrap_or_default(),
+        "source_gains": lock(&i.source).as_ref().map(|s| s.info().gains).unwrap_or_default(),
+        "time_shift": shift,
+        "station": c.station,
+        "locator": locator::from_lat_lon(c.station.lat, c.station.lon),
+        "follow_gps": c.follow_gps,
+        "markers": lock(&i.sat).markers.clone(),
+        "lab": lab::status(i),
+        "debug_mode": c.debug_mode,
+        "lab_pin": c.lab_pin,
+        "update_req": lock(&i.update_req).0,
+        "aprs": aprs_status(i, c.aprs, 20),
+        "ground_aprs": json!({ "on": c.ground_aprs, "hz": c.ground_aprs_hz }),
+        "plugins": plugin_status(i, c.plugins, 20),
+        "sstv": sstv_status(i, c.sstv),
+        "fsk9k6": fsk_status(i, c.fsk9k6),
+        "update_prerelease": lock(&i.update_req).1,
+        "recording": lock(&i.recorder).as_ref().map(|r| json!({ "name": r.name, "secs": r.seconds(), "bytes": r.bytes(), "dropped": r.dropped })),
+    })
+}
+
+/// Run the APRS decoder on new audio; good frames go to the list with their time and frequency.
+fn aprs_feed(i: &Inner, audio: &[f32], vfo_hz: f64) {
+    let want = lock(&i.cfg).aprs;
+    let mut g = lock(&i.aprs);
+    if g.is_none() && want {
+        *g = Some(sh_dsp::afsk::AfskDecoder::new(sh_dsp::demod::AUDIO_RATE)); // switched on in an earlier run
+    }
+    let Some(d) = g.as_mut() else { return };
+    d.process(audio);
+    if d.frames.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs_f64()).unwrap_or(0.0);
+    let frames: Vec<sh_dsp::afsk::Ax25Frame> = d.frames.drain(..).collect();
+    drop(g);
+    {
+        let mut q = lock(&i.aprs_frames);
+        for f in &frames {
+            q.0 += 1;
+            let n = q.0;
+            let info = String::from_utf8_lossy(&f.info);
+            let pos = sh_dsp::afsk::aprs_position(&info).or_else(|| sh_dsp::afsk::mic_e_position(&f.dst, &info));
+            q.1.push_back(json!({
+                "n": n, "time": now, "freq_hz": vfo_hz, "tnc2": f.tnc2(), "src": f.src, "dst": f.dst, "path": f.path,
+                "info": String::from_utf8_lossy(&f.info), "lat": pos.map(|p| p.0), "lon": pos.map(|p| p.1),
+            }));
+            while q.1.len() > 200 {
+                q.1.pop_front();
+            }
+        }
+    }
+    let (on, norad) = {
+        let c = lock(&i.cfg);
+        // terrestrial APRS: the generic plugins, whatever satellite is selected
+        (c.plugins, if c.ground_aprs { None } else { c.selected })
+    };
+    if on {
+        let mut h = lock(&i.plugins);
+        let host = h.get_or_insert_with(plugins::Host::load);
+        for f in &frames {
+            host.ax25(f, norad, vfo_hz, now);
+        }
+    }
+}
+
+/// Run the 9600 bd G3RUH decoder on the FM discriminator. AX.25 frames join the APRS / AX.25
+/// list (and the plugins) like the AFSK ones; other frames with a good CRC (AX.100, CSP) are
+/// listed raw, as hex.
+fn fsk_feed(i: &Inner, disc: &[f32], rate: f64, vfo_hz: f64) {
+    if disc.is_empty() || !lock(&i.cfg).fsk9k6 {
+        return;
+    }
+    let mut g = lock(&i.fsk);
+    if g.as_ref().map(|d| (d.rate() - rate).abs() > 1.0).unwrap_or(true) {
+        *g = Some(sh_dsp::fsk9600::G3ruhDecoder::new(rate));
+    }
+    let Some(d) = g.as_mut() else { return };
+    d.process(disc);
+    if d.frames.is_empty() {
+        return;
+    }
+    let frames: Vec<sh_dsp::fsk9600::RawFrame> = d.frames.drain(..).collect();
+    drop(g);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs_f64()).unwrap_or(0.0);
+    {
+        let mut q = lock(&i.aprs_frames);
+        for f in &frames {
+            q.0 += 1;
+            let n = q.0;
+            let hex: String = f.data.iter().map(|b| format!("{b:02x}")).collect();
+            q.1.push_back(match &f.ax25 {
+                Some(a) => {
+                    let info = String::from_utf8_lossy(&a.info);
+                    let pos = sh_dsp::afsk::aprs_position(&info).or_else(|| sh_dsp::afsk::mic_e_position(&a.dst, &info));
+                    json!({
+                        "n": n, "time": now, "freq_hz": vfo_hz, "tnc2": a.tnc2(), "src": a.src, "dst": a.dst, "path": a.path,
+                        "info": info, "lat": pos.map(|p| p.0), "lon": pos.map(|p| p.1), "modem": "9k6", "raw": hex,
+                    })
+                }
+                None => json!({ "n": n, "time": now, "freq_hz": vfo_hz, "tnc2": format!("[9k6 {} bytes] {hex}", f.data.len()), "src": "", "modem": "9k6", "raw": hex }),
+            });
+            while q.1.len() > 200 {
+                q.1.pop_front();
+            }
+        }
+    }
+    let (on, norad) = {
+        let c = lock(&i.cfg);
+        (c.plugins, if c.ground_aprs { None } else { c.selected })
+    };
+    if on {
+        let mut h = lock(&i.plugins);
+        let host = h.get_or_insert_with(plugins::Host::load);
+        for f in &frames {
+            host.fsk9600(f, norad, vfo_hz, now);
+        }
+    }
+}
+
+fn fsk_status(i: &Inner, on: bool) -> Value {
+    let g = lock(&i.fsk);
+    json!({ "on": on, "count": g.as_ref().map(|d| d.count).unwrap_or(0), "bad_crc": g.as_ref().map(|d| d.bad_crc).unwrap_or(0) })
+}
+
+/// Run the SSTV decoder on new audio; finished pictures go to the list.
+fn sstv_feed(i: &Inner, audio: &[f32]) {
+    let want = lock(&i.cfg).sstv;
+    let mut g = lock(&i.sstv);
+    if g.is_none() && want {
+        *g = Some(sh_dsp::sstv::SstvDecoder::new(sh_dsp::demod::AUDIO_RATE));
+    }
+    let Some(d) = g.as_mut() else { return };
+    d.process(audio);
+    if d.done.is_empty() {
+        return;
+    }
+    let pics: Vec<_> = d.done.drain(..).collect();
+    drop(g);
+    let mut q = lock(&i.sstv_pics);
+    for p in pics {
+        q.0 += 1;
+        q.1.push_back(p);
+        while q.1.len() > 4 {
+            q.1.pop_front();
+        }
+    }
+}
+
+/// SSTV state: on, the picture being received (mode, rows), how many are finished.
+pub(crate) fn sstv_status(i: &Inner, on: bool) -> Value {
+    // lock order: sstv, then sstv_pics
+    let rx = lock(&i.sstv).as_ref().and_then(|d| d.current().map(|c| json!({ "mode": c.mode.name(), "rows": c.rows, "height": c.height, "syncs": c.syncs_found })));
+    let q = lock(&i.sstv_pics);
+    json!({ "on": on, "receiving": rx, "count": q.0, "last": q.1.back().map(|p| json!({ "mode": p.mode.name(), "rows": p.rows, "height": p.height })) })
+}
+
+/// The picture being received (`current`) or the last finished one, with its number (0 = in progress).
+pub(crate) fn sstv_image(i: &Inner, current: bool) -> Option<(sh_dsp::sstv::SstvImage, u64)> {
+    if current {
+        if let Some(c) = lock(&i.sstv).as_ref().and_then(|d| d.current().cloned()) {
+            return Some((c, 0));
+        }
+    }
+    let q = lock(&i.sstv_pics);
+    q.1.back().cloned().map(|p| (p, q.0))
+}
+
+fn base64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(b.len() * 4 / 3 + 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        s.push(T[(n >> 18) as usize & 63] as char);
+        s.push(T[(n >> 12) as usize & 63] as char);
+        s.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        s.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    s
+}
+
+/// Plugin output after number `since`, and which plugins are loaded.
+pub(crate) fn plugin_out(i: &Inner, since: u64) -> Value {
+    let on = lock(&i.cfg).plugins;
+    let mut h = lock(&i.plugins);
+    let mut v = if on { h.get_or_insert_with(plugins::Host::load).since(since) } else { json!({ "plugins": [], "errors": [], "count": 0, "out": [] }) };
+    v["on"] = on.into();
+    v
+}
+
+/// Plugin state and the last `n` outputs (no loading here: status is polled often).
+pub(crate) fn plugin_status(i: &Inner, on: bool, n: usize) -> Value {
+    let h = lock(&i.plugins);
+    match h.as_ref() {
+        Some(h) => {
+            let skip = h.out.1.len().saturating_sub(n);
+            json!({ "on": on, "loaded": h.ids(), "errors": h.errors, "count": h.out.0, "out": h.out.1.iter().skip(skip).cloned().collect::<Vec<_>>(), "pins": h.pins })
+        }
+        None => json!({ "on": on, "loaded": [], "errors": [], "count": 0, "out": [], "pins": [] }),
+    }
+}
+
+/// APRS decoder state and the last `n` frames.
+pub(crate) fn aprs_status(i: &Inner, on: bool, n: usize) -> Value {
+    // lock order everywhere: aprs, then aprs_frames
+    let bad = lock(&i.aprs).as_ref().map(|d| d.bad_crc).unwrap_or(0);
+    let q = lock(&i.aprs_frames);
+    let skip = q.1.len().saturating_sub(n);
+    json!({ "on": on, "count": q.0, "bad_crc": bad, "frames": q.1.iter().skip(skip).cloned().collect::<Vec<_>>() })
+}
+
+/// Frames with a number above `since` (the lab link polls with the last number it saw).
+pub(crate) fn aprs_since(i: &Inner, since: u64) -> Value {
+    let bad = lock(&i.aprs).as_ref().map(|d| d.bad_crc).unwrap_or(0);
+    let q = lock(&i.aprs_frames);
+    json!({ "count": q.0, "bad_crc": bad, "frames": q.1.iter().filter(|f| f["n"].as_u64().unwrap_or(0) > since).cloned().collect::<Vec<_>>() })
+}
+
+fn sat_list(i: &Inner) -> Value {
+    let s = lock(&i.sat);
+    let c = lock(&i.cfg);
+    let now = now_unix() + lock(&i.time_shift).0;
+    let rows: Vec<&sat::Row> = s.rows.iter().filter(|r| r.pass.los >= now || r.pass.always).collect();
+    let age = sat::cache_age_hours(&i.dir);
+    json!({
+        "now": now,
+        "rows": rows,
+        "stats": {
+            "satellites": s.stats.satellites, "tles": s.stats.tles, "transmitters": s.stats.transmitters,
+            "hungarian": s.stats.hungarian,
+        },
+        "status": s.status,
+        "busy": s.busy,
+        "progress": if s.calc_total > 0 { json!([s.calc_done, s.calc_total]) } else { Value::Null },
+        "age_hours": age,
+        "filter": c.filter,
+        "favourites": c.favourites,
+        "bands": sh_sat::Band::ALL.iter().map(|b| json!({"id": b, "name": b.name()})).collect::<Vec<_>>(),
+    })
+}
+
+fn sat_detail(i: &Inner) -> Value {
+    let c = lock(&i.cfg).clone();
+    let Some(norad) = c.selected else { return json!({ "selected": Value::Null }) };
+    let st: Station = c.station;
+    let s = lock(&i.sat);
+    let Some(sat) = s.sats.iter().find(|x| x.norad == norad) else { return json!({ "selected": Value::Null }) };
+    let now = now_unix() + lock(&i.time_shift).0;
+    let look = sat.orbit.look(&st, now).ok();
+    let tx = c.selected_tx.as_ref().and_then(|u| sat.tx.iter().find(|t| &t.uuid == u)).or(sat.tx.first());
+    let txs: Vec<Value> = sat
+        .tx
+        .iter()
+        .map(|t| {
+            json!({
+                "uuid": t.uuid, "description": t.description, "mode": t.mode, "freq": t.centre(),
+                "low": t.down_low, "high": t.down_high, "baud": t.baud, "active": t.active(),
+                "matches": c.filter.tx_matches(t),
+            })
+        })
+        .collect();
+    let (doppler, rx) = match (look, tx) {
+        (Some(l), Some(t)) => {
+            let aos = if waiting_for_aos(l.el, s.sel_pass.as_ref(), now) {
+                s.sel_pass.and_then(|p| sat.orbit.look(&st, p.aos).ok())
+            } else {
+                None
+            };
+            let f = s.tracker.target(t.centre(), &l, aos.as_ref());
+            (f - t.centre() - s.tracker.user_offset, f)
+        }
+        _ => (0.0, 0.0),
+    };
+    json!({
+        "selected": norad,
+        "name": sat.name,
+        "hungarian": sat.hungarian,
+        "favourite": c.favourites.contains(&norad),
+        "tx": txs,
+        "selected_tx": tx.map(|t| t.uuid.clone()),
+        "look": look.map(|l| json!({"az": l.az, "el": l.el, "range_km": l.range_km, "range_rate_kms": l.range_rate_kms})),
+        "sub": sat.orbit.subpoint(now).ok().map(|(lat, lon, h)| json!({"lat": lat, "lon": lon, "alt_km": h})),
+        // ground track for the map: 15 min back, 90 min ahead, 30 s steps
+        "ground": (-30..=180).filter_map(|k| sat.orbit.subpoint(now + 30.0 * k as f64).ok().map(|(a, b, _)| [(a * 100.0).round() / 100.0, (b * 100.0).round() / 100.0])).collect::<Vec<_>>(),
+        "pass": s.sel_pass,
+        "track": s.track,
+        "others": s.others,
+        "tracking": s.tracking,
+        "user_offset": s.tracker.user_offset,
+        "doppler_hz": doppler,
+        "rx_hz": rx,
+        "now": now,
+        "simulated": lock(&i.time_shift).0 != 0.0,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sathunter-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sat")).unwrap();
+        d
+    }
+
+    fn write_iss(d: &Path) {
+        std::fs::write(d.join("sat/transmitters.json"), r#"[
+          {"uuid":"aprs","description":"APRS","alive":true,"downlink_low":145825000,"mode":"AFSK","baud":1200,"norad_cat_id":25544,"status":"active","service":"Unknown"},
+          {"uuid":"lin","description":"Lin","alive":true,"downlink_low":435760000,"downlink_high":435800000,"mode":"USB","norad_cat_id":25544,"status":"active","service":"Amateur"}]"#).unwrap();
+        std::fs::write(d.join("sat/tle_satnogs.json"), r#"[{"tle0":"0 ISS","tle1":"1 25544U 98067A   26282.95044904  .00006711  00000-0  13074-3 0  9998","tle2":"2 25544  51.6315  92.1575 0006672 244.0714 115.9587 15.48795780589546","norad_cat_id":25544}]"#).unwrap();
+        std::fs::write(d.join("sat/satellites.json"), r#"[{"name":"ISS","norad_cat_id":25544,"status":"in orbit","countries":"RU,US"}]"#).unwrap();
+    }
+
+    fn cmd(e: &Engine, j: &str) -> Value {
+        serde_json::from_str(&e.command(j)).unwrap()
+    }
+
+    #[test]
+    fn demo_runs_and_delivers_spectrum_and_audio() {
+        let d = tmpdir("demo");
+        write_iss(&d);
+        // No download in the test: cache is fresh and auto update off
+        Config { update_days: 0.0, rate: 1_024_000.0, fft_size: 2048, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        assert_eq!(cmd(&e, r#"{"cmd":"start"}"#)["ok"], true);
+        std::thread::sleep(Duration::from_millis(600));
+        let mut rows = vec![0.0f32; 2048 * 64];
+        let mut meta = vec![0.0f64; 128];
+        let (n, bins) = e.spectrum_rows(&mut rows, &mut meta);
+        assert!(meta[1] > 0.0, "row rate");
+        assert!(n > 0 && bins == 2048, "no spectrum rows");
+        // Audio keeps coming (a loaded test machine may be slow: wait up to 3 s)
+        let mut a = vec![0.0f32; 48_000];
+        let mut got = 0;
+        for _ in 0..30 {
+            got += e.audio(&mut a);
+            if got > 10_000 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(got > 10_000, "audio {got}");
+        let st = cmd(&e, r#"{"cmd":"status"}"#);
+        assert_eq!(st["running"], true);
+        assert_eq!(cmd(&e, r#"{"cmd":"bogus"}"#)["ok"], false);
+        cmd(&e, r#"{"cmd":"stop"}"#);
+    }
+
+    #[test]
+    fn center_tuning_keeps_the_vfo_in_the_middle() {
+        let d = tmpdir("ctune");
+        write_iss(&d);
+        Config { update_days: 0.0, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        cmd(&e, r#"{"cmd":"source","id":"demo"}"#);
+        assert_eq!(cmd(&e, r#"{"cmd":"center_tuning","on":true}"#)["ok"], true);
+        cmd(&e, r#"{"cmd":"tune","hz":101500000}"#);
+        let st = cmd(&e, r#"{"cmd":"status"}"#);
+        assert_eq!(st["center_hz"], st["vfo_hz"]);
+        assert_eq!(st["vfo_hz"].as_f64(), Some(101.5e6));
+        cmd(&e, r#"{"cmd":"center","hz":102000000}"#);
+        let st = cmd(&e, r#"{"cmd":"status"}"#);
+        assert_eq!(st["vfo_hz"].as_f64(), Some(102e6));
+        assert_eq!(st["center_tuning"], true);
+    }
+
+    #[test]
+    fn ground_aprs_mode_tunes_and_stops_tracking() {
+        let d = tmpdir("gaprs");
+        write_iss(&d);
+        Config { update_days: 0.0, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        for _ in 0..200 {
+            if cmd(&e, r#"{"cmd":"sat_list"}"#)["rows"].as_array().map(|r| !r.is_empty()).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        cmd(&e, r#"{"cmd":"source","id":"demo"}"#);
+        cmd(&e, r#"{"cmd":"sat_select","norad":25544}"#);
+        assert_eq!(cmd(&e, r#"{"cmd":"ground_aprs","on":true}"#)["ok"], true);
+        let st = cmd(&e, r#"{"cmd":"status"}"#);
+        assert_eq!(st["vfo_hz"].as_f64(), Some(144.8e6));
+        assert_eq!(st["mode"], "NFM");
+        assert_eq!(st["aprs"]["on"], true);
+        assert_eq!(st["ground_aprs"]["on"], true);
+        let det = cmd(&e, r#"{"cmd":"sat_detail"}"#);
+        assert_eq!(det["tracking"], false, "{det}");
+        // another frequency, remembered
+        cmd(&e, r#"{"cmd":"ground_aprs","on":true,"hz":144390000}"#);
+        assert_eq!(cmd(&e, r#"{"cmd":"status"}"#)["vfo_hz"].as_f64(), Some(144.39e6));
+        // tracking a satellite again ends the mode
+        cmd(&e, r#"{"cmd":"sat_track","on":true}"#);
+        let st = cmd(&e, r#"{"cmd":"status"}"#);
+        assert_eq!(st["ground_aprs"]["on"], false);
+        assert_eq!(st["ground_aprs"]["hz"].as_f64(), Some(144.39e6));
+    }
+
+    #[test]
+    fn decimation_narrows_the_span_and_keeps_the_vfo_inside() {
+        let d = tmpdir("decim");
+        write_iss(&d);
+        Config { update_days: 0.0, rate: 2_400_000.0, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        cmd(&e, r#"{"cmd":"source","id":"demo"}"#);
+        assert_eq!(cmd(&e, r#"{"cmd":"decimation","factor":8}"#)["factor"], 8);
+        cmd(&e, r#"{"cmd":"tune","hz":145800000}"#);
+        std::thread::sleep(Duration::from_millis(500));
+        let st = cmd(&e, r#"{"cmd":"status"}"#);
+        assert_eq!(st["decimation"], 8);
+        assert_eq!(st["spectrum_rate"].as_f64(), Some(300_000.0));
+        let (c, v) = (st["spectrum_center_hz"].as_f64().unwrap(), st["vfo_hz"].as_f64().unwrap());
+        assert!((v - c).abs() < 0.45 * 300_000.0, "vfo {v} outside the decimated span around {c}");
+        // and back to the full span
+        cmd(&e, r#"{"cmd":"decimation","factor":1}"#);
+        std::thread::sleep(Duration::from_millis(500));
+        let st = cmd(&e, r#"{"cmd":"status"}"#);
+        assert_eq!(st["spectrum_rate"].as_f64(), Some(2_400_000.0));
+        cmd(&e, r#"{"cmd":"stop"}"#);
+    }
+
+    /// Spectrum rows for `ms`: (centre, rate, max-hold over the rows).
+    fn collect_rows(e: &Engine, ms: u64) -> (f64, f64, Vec<f32>) {
+        let mut rows = vec![0.0f32; 16384 * 64];
+        let mut meta = vec![0.0f64; 128];
+        let mut hold: Vec<f32> = Vec::new();
+        let (mut c, mut r) = (0.0, 0.0);
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_millis(ms) {
+            let (n, bins) = e.spectrum_rows(&mut rows, &mut meta);
+            for k in 0..n {
+                if hold.len() != bins {
+                    hold = vec![-200.0; bins];
+                }
+                c = meta[2 * k];
+                r = meta[2 * k + 1];
+                for (h, v) in hold.iter_mut().zip(&rows[k * bins..(k + 1) * bins]) {
+                    *h = h.max(*v);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (c, r, hold)
+    }
+
+    /// The demo's CW beacon (432.400 MHz) through decimation by 8: the span is 300 kHz around
+    /// the VFO, the beacon is in its bin and well above the noise, and the CW audio comes.
+    #[test]
+    fn decimated_demo_beacon_is_where_it_should_be() {
+        let d = tmpdir("decim_cw");
+        write_iss(&d);
+        Config { update_days: 0.0, rate: 2_400_000.0, fft_size: 8192, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        cmd(&e, r#"{"cmd":"source","id":"demo"}"#);
+        cmd(&e, r#"{"cmd":"decimation","factor":8}"#);
+        cmd(&e, r#"{"cmd":"mode","mode":"CW"}"#);
+        cmd(&e, r#"{"cmd":"tune","hz":432400000}"#);
+        std::thread::sleep(Duration::from_millis(300));
+        e.spectrum_rows(&mut vec![0.0f32; 16384 * 64], &mut vec![0.0f64; 128]); // drop rows from before the retune
+        let (c, r, hold) = collect_rows(&e, 2500);
+        assert_eq!(r, 300_000.0);
+        assert!((432.4e6 - c).abs() < 0.4 * r, "beacon outside the span: centre {c}");
+        let n = hold.len();
+        let bin_hz = r / n as f64;
+        let peak = hold.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+        let f_peak = c + (peak.0 as f64 - n as f64 / 2.0) * bin_hz;
+        assert!((f_peak - 432.4e6).abs() < 3.0 * bin_hz.max(100.0), "peak at {f_peak} Hz");
+        let mut sorted = hold.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = sorted[n / 2];
+        assert!(peak.1 - median > 15.0, "beacon {} dB over the noise", peak.1 - median);
+        let mut a = vec![0.0f32; 48_000];
+        let mut got = 0;
+        let mut energy = 0.0f32;
+        for _ in 0..20 {
+            let k = e.audio(&mut a);
+            energy += a[..k].iter().map(|v| v * v).sum::<f32>();
+            got += k;
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(got > 20_000 && energy > 1.0, "audio {got} samples, energy {energy}");
+        cmd(&e, r#"{"cmd":"stop"}"#);
+    }
+
+    /// Record the demo's CW beacon through decimation, read the file back and decode the
+    /// beacon from the recording with the same demodulator and the CW decoder.
+    #[test]
+    fn iq_recording_plays_back_and_decodes() {
+        let d = tmpdir("rec");
+        write_iss(&d);
+        Config { update_days: 0.0, rate: 2_400_000.0, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        cmd(&e, r#"{"cmd":"source","id":"demo"}"#);
+        cmd(&e, r#"{"cmd":"decimation","factor":8}"#);
+        cmd(&e, r#"{"cmd":"tune","hz":432400000}"#);
+        std::thread::sleep(Duration::from_millis(300));
+        let out = d.join("rec");
+        let r = cmd(&e, &format!(r#"{{"cmd":"record_start","dir":"{}"}}"#, out.display()));
+        assert_eq!(r["ok"], true, "{r}");
+        let name = r["name"].as_str().unwrap().to_string();
+        assert!(name.starts_with("baseband_") && name.ends_with(".wav"));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(cmd(&e, r#"{"cmd":"status"}"#)["recording"]["secs"].as_f64().unwrap() > 0.1);
+        std::thread::sleep(Duration::from_millis(5500));
+        let r = cmd(&e, r#"{"cmd":"record_stop"}"#);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(cmd(&e, r#"{"cmd":"status"}"#)["recording"].is_null());
+        cmd(&e, r#"{"cmd":"stop"}"#);
+        let (fs, iq, meta) = record::read_wav(&std::fs::read(out.join(&name)).unwrap()).unwrap();
+        assert_eq!(fs, 300_000.0);
+        assert!(iq.len() as f64 > 5.0 * fs, "{} samples", iq.len());
+        assert_eq!(meta["decimation"], 8);
+        let center = meta["center_hz"].as_f64().unwrap();
+        // Demodulate the recording as CW (USB-like beat) and decode
+        let mut dm = Demodulator::new(Mode::Cw, fs, 432.4e6 - center, 500.0);
+        let mut audio = Vec::new();
+        dm.process(&iq, &mut audio);
+        let rep = sh_dsp::cw::decode(&audio, sh_dsp::demod::AUDIO_RATE, (300.0, 3500.0));
+        assert!(rep.text.contains("VV DE HG0"), "decoded {:?}", rep.text); // the 6 s recording ends there
+    }
+
+    /// The lab link over real HTTP: PIN check, a command, a phase on the console, and a
+    /// measurement of the demo's CW beacon (level, frequency) and its CW decode.
+    #[test]
+    fn lab_link_measures_the_demo_beacon() {
+        let d = tmpdir("lab");
+        write_iss(&d);
+        Config { update_days: 0.0, rate: 2_400_000.0, fft_size: 8192, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        cmd(&e, r#"{"cmd":"source","id":"demo"}"#);
+        let st = cmd(&e, r#"{"cmd":"lab_start","port":18765}"#);
+        assert_eq!(st["on"], true, "{st}");
+        let pin = st["pin"].as_str().unwrap().to_string();
+        let base = "http://127.0.0.1:18765";
+        let get = |p: &str| -> (u16, Value) {
+            match ureq::get(&format!("{base}{p}")).call() {
+                Ok(mut r) => (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap_or(Value::Null)),
+                Err(ureq::Error::StatusCode(c)) => (c, Value::Null),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let post = |p: &str, body: &str| -> Value {
+            let mut r = ureq::post(&format!("{base}{p}?pin={pin}")).send(body.as_bytes()).unwrap();
+            serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap()
+        };
+        assert_eq!(get("/status?pin=000000").0, 403);
+        assert_eq!(get(&format!("/status?pin={pin}")).1["running"], true);
+        assert_eq!(post("/cmd", r#"{"cmd":"decimation","factor":8}"#)["ok"], true);
+        assert_eq!(post("/cmd", r#"{"cmd":"mode","mode":"CW"}"#)["ok"], true);
+        assert_eq!(post("/cmd", r#"{"cmd":"tune","hz":432400000}"#)["ok"], true);
+        assert_eq!(post("/phase", r#"{"phase":"self test","step":1,"total":2,"detail":"demo beacon"}"#)["ok"], true);
+        std::thread::sleep(Duration::from_millis(500));
+        let (code, m) = get(&format!("/measure?pin={pin}&hz=432400000&bw=2000&secs=3"));
+        assert_eq!(code, 200, "{m}");
+        assert!(m["peak_snr_db"].as_f64().unwrap() > 15.0, "{m}");
+        assert!(m["offset_hz"].as_f64().unwrap().abs() < 100.0, "{m}");
+        std::thread::sleep(Duration::from_millis(5000));
+        let (_, c) = get(&format!("/cw?pin={pin}&secs=8"));
+        assert!(c["text"].as_str().unwrap_or("").contains("DE HG0DEMO") || c["text"].as_str().unwrap_or("").contains("DEMO"), "{c}");
+        let lg = cmd(&e, r#"{"cmd":"status"}"#)["lab"]["log"].to_string();
+        assert!(lg.contains("PHASE [1/2] self test") && lg.contains("PC connected"), "{lg}");
+        cmd(&e, r#"{"cmd":"lab_stop"}"#);
+        assert!(ureq::get(&format!("{base}/status?pin={pin}")).call().is_err());
+        cmd(&e, r#"{"cmd":"stop"}"#);
+    }
+
+    #[test]
+    fn satellite_selection_tracks_doppler() {
+        let d = tmpdir("sat");
+        write_iss(&d);
+        Config { update_days: 0.0, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        // Wait for the pass list
+        let mut list = Value::Null;
+        for _ in 0..200 {
+            list = cmd(&e, r#"{"cmd":"sat_list"}"#);
+            if list["rows"].as_array().map(|r| !r.is_empty()).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(list["rows"][0]["norad"], 25544, "{list}");
+        cmd(&e, r#"{"cmd":"start"}"#);
+        cmd(&e, r#"{"cmd":"sat_select","norad":25544,"tx":"lin"}"#);
+        // the tracker picks it up within a cycle (longer on a loaded CI machine)
+        let mut det = Value::Null;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            det = cmd(&e, r#"{"cmd":"sat_detail"}"#);
+            if det["tracking"] == true && det["rx_hz"].is_number() {
+                std::thread::sleep(Duration::from_millis(300));
+                det = cmd(&e, r#"{"cmd":"sat_detail"}"#);
+                break;
+            }
+        }
+        assert_eq!(det["tracking"], true, "{det}");
+        let rx = det["rx_hz"].as_f64().unwrap();
+        assert!((rx - 435_780_000.0).abs() < 12_000.0, "rx {rx}");
+        let st = cmd(&e, r#"{"cmd":"status"}"#);
+        assert_eq!(st["mode"], "USB");
+        assert!((st["vfo_hz"].as_f64().unwrap() - rx).abs() < 50.0, "vfo {} rx {rx}", st["vfo_hz"]);
+        // Simulated pass: the satellite comes up within seconds
+        // (only when the next pass is still ahead: with the real clock the ISS can be up right now,
+        // and then there is nothing to simulate)
+        let mut det = cmd(&e, r#"{"cmd":"sat_detail"}"#);
+        for _ in 0..40 {
+            if det["pass"].is_object() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            det = cmd(&e, r#"{"cmd":"sat_detail"}"#);
+        }
+        let ahead = det["pass"]["aos"].as_f64().zip(det["now"].as_f64()).is_some_and(|(aos, now)| aos > now + 5.0);
+        if ahead && det["pass"]["always"] != true {
+            cmd(&e, r#"{"cmd":"simulate"}"#);
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(100));
+                det = cmd(&e, r#"{"cmd":"sat_detail"}"#);
+                if det["simulated"] == true {
+                    break;
+                }
+            }
+            assert_eq!(det["simulated"], true, "{det}");
+        }
+        cmd(&e, r#"{"cmd":"stop"}"#);
+    }
+}

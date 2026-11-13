@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/sh-apple", "crates/sh-dsp", "crates/sh-engine", "crates/sh-plugin", "crates/sh-sat", "crates/sh-sources"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Zoltan Doczi"]
+repository = "https://github.com/albertovm/SDR-Outdoor"
+
+[workspace.dependencies]
+sgp4 = "2.4"
+rustfft = "6.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+log = "0.4"
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+[patch.crates-io]
+# rtl-sdr-rs with the Android build fix (third_party/rtl-sdr-rs/PATCHES.md)
+rtl-sdr-rs = { path = "third_party/rtl-sdr-rs" }

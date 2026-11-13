@@ -1,0 +1,8 @@
+.DS_Store
+*.xcuserstate
+*.xcuserdata/
+DerivedData/
+apple/build/
+core/target/
+.build/
+__pycache__/
