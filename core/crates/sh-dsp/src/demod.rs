@@ -41,7 +41,8 @@ impl Mode {
     pub fn default_bw(self) -> f64 {
         match self {
             Mode::Nfm => 12_500.0,
-            Mode::Wfm => 150_000.0,
+            // Match the Android app and SDR++ broadcast FM preset.
+            Mode::Wfm => 180_000.0,
             Mode::Am => 10_000.0,
             Mode::Usb | Mode::Lsb => 2_800.0,
             // Wide enough for a beacon a few hundred Hz off (RTL crystal, satellite TX offset)

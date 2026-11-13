@@ -26,7 +26,7 @@ impl TunerId {
     pub const R828D: &'static str = R828D_TUNER_ID;
 }
 
-/// SatHunterSDR patch: the app knows the USB product strings (Android UsbDevice) even when
+/// SDR Outdoor patch: the app knows the USB product strings (Android UsbDevice) even when
 /// reading them over the file descriptor fails; a true hint selects the RTL-SDR Blog V4 setup
 /// (R828D on the 28.8 MHz crystal, V4 input switching).
 static BLOG_V4_HINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -58,7 +58,7 @@ pub struct DeviceDescriptor {
 
 impl DeviceDescriptors {
     pub fn new() -> Result<Self> {
-        // SatHunterSDR patch: nusb has no device enumeration on Android (apps get a file
+        // SDR Outdoor patch: nusb has no device enumeration on Android (apps get a file
         // descriptor from the USB permission instead, see DeviceId::Fd)
         #[cfg(target_os = "android")]
         let list = Vec::new();

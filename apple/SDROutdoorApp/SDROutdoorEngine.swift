@@ -1,10 +1,10 @@
 import Foundation
 import SwiftUI
 import UIKit
-import SatHunterCore
+import SDROutdoorCore
 
 @MainActor
-final class SatHunterEngine: ObservableObject {
+final class SDROutdoorEngine: ObservableObject {
     @Published private(set) var status: [String: Any] = [:]
     @Published private(set) var satelliteRows: [[String: Any]] = []
     @Published private(set) var detail: [String: Any] = [:]
@@ -26,18 +26,15 @@ final class SatHunterEngine: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var timer: Timer?
     private var initialized = false
-    #if DEBUG
-    private var didRunDebugAutoconnect = false
-    #endif
     init() {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("SatHunterSDR", isDirectory: true)
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("SDR Outdoor", isDirectory: true)
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) } catch { lastError = error.localizedDescription }
     }
     private func ensureInitialized() {
         guard !initialized else { return }
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("SatHunterSDR", isDirectory: true)
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("SDR Outdoor", isDirectory: true)
         seedSatelliteCache(at: dir)
-        _ = dir.path.withCString { sh_apple_init($0) }
+        _ = dir.path.withCString { sdr_outdoor_apple_init($0) }
         initialized = true
         location.onHeading = { [weak self] value in self?.heading = value.trueHeading >= 0 ? value.trueHeading : value.magneticHeading }
         location.onLocation = { [weak self] point in self?.gpsText = String(format: "%.5f, %.5f • %.0f m", point.coordinate.latitude, point.coordinate.longitude, point.altitude); _ = self?.command(["cmd":"gps", "lat":point.coordinate.latitude, "lon":point.coordinate.longitude, "alt":point.altitude]) }
@@ -45,6 +42,11 @@ final class SatHunterEngine: ObservableObject {
         if let mode = UserDefaults.standard.string(forKey: "mode") { _ = command(["cmd":"mode", "mode":mode]) }
         if let norad = UserDefaults.standard.object(forKey: "selectedNorad") as? Int { _ = command(["cmd":"sat_select", "norad":norad]) }
         refresh()
+        // Upgrade the previous WFM default (150 kHz) to the Android/SDR++ broadcast preset.
+        if status["mode"] as? String == "WFM", abs((status["bw"] as? Double ?? 0) - 150_000) < 1 {
+            _ = command(["cmd":"mode", "mode":"WFM"])
+            refresh()
+        }
         if satelliteRows.isEmpty { _ = command(["cmd":"sat_update"]); refresh() }
     }
     /// Keep the first launch useful when the network is unavailable. The Rust worker will
@@ -62,30 +64,19 @@ final class SatHunterEngine: ObservableObject {
     }
     func bootstrap() {
         ensureInitialized()
-        #if DEBUG
-        if !didRunDebugAutoconnect && ProcessInfo.processInfo.arguments.contains("-SDRPPTestConnect") {
-            didRunDebugAutoconnect = true
-            let args = ProcessInfo.processInfo.arguments
-            let testPort = args.firstIndex(of: "-SDRPPTestPort").flatMap { args.indices.contains($0 + 1) ? Int(args[$0 + 1]) : nil }
-            configureSdrpp(host: "127.0.0.1", port: testPort ?? 5259)
-            if let index = args.firstIndex(of: "-SDRPPTestTune"), args.indices.contains(index + 1), let frequency = Double(args[index + 1]) {
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(2))
-                    tune(frequency)
-                }
-            }
-        }
-        #endif
     }
     @discardableResult func command(_ object: [String: Any]) -> [String: Any] {
-        guard let data = try? JSONSerialization.data(withJSONObject: object), let json = String(data: data, encoding: .utf8), let pointer = json.withCString({ sh_apple_command($0) }) else { return ["ok": false, "error": "comando inválido"] }
-        defer { sh_apple_string_free(pointer) }
+        guard let data = try? JSONSerialization.data(withJSONObject: object), let json = String(data: data, encoding: .utf8), let pointer = json.withCString({ sdr_outdoor_apple_command($0) }) else { return ["ok": false, "error": "comando inválido"] }
+        defer { sdr_outdoor_apple_string_free(pointer) }
         guard let data = String(cString: pointer).data(using: .utf8), let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ["ok": false, "error": "resposta inválida"] }
         if value["ok"] as? Bool == false { lastError = value["error"] as? String }; return value
     }
     func refresh() {
         guard initialized else { return }
         status = command(["cmd":"status"])
+        let satellites = command(["cmd":"sat_list"])
+        satelliteRows = satellites["rows"] as? [[String: Any]] ?? []
+        detail = command(["cmd":"sat_detail"])
         if status["running"] as? Bool != true {
             spectrum.removeAll()
             waterfall.removeAll()
@@ -93,16 +84,13 @@ final class SatHunterEngine: ObservableObject {
             return
         }
         if let plugins = status["plugins"] as? [String: Any] { pluginPins = plugins["pins"] as? [[String: Any]] ?? [] }
-        let satellites = command(["cmd":"sat_list"])
-        satelliteRows = satellites["rows"] as? [[String: Any]] ?? []
-        detail = command(["cmd":"sat_detail"])
         if (status["sstv"] as? [String: Any])?["on"] as? Bool == true { loadSSTVImage() }
         var values = [Float](repeating: 0, count: 16384)
         var metadata = [Double](repeating: 0, count: 2)
         var newest: [Float]?
         var added = 0
         for _ in 0..<16 {
-            let packed = sh_apple_spectrum_rows(&values, values.count, &metadata, metadata.count)
+            let packed = sdr_outdoor_apple_spectrum_rows(&values, values.count, &metadata, metadata.count)
             let rows = Int(packed >> 16)
             let bins = Int(packed & 0xffff) * 16
             guard rows > 0 && bins > 0 && bins <= values.count else { break }
@@ -148,7 +136,7 @@ final class SatHunterEngine: ObservableObject {
         refresh()
     }
     func changeVolume(_ delta: Float) { volume = max(0, min(1, volume + delta)); audio.setVolume(volume) }
-    func start() { ensureInitialized(); _ = command(["cmd":"start"]); audio.start(); audio.setVolume(volume); refresh() }; func stop() { wantsSdrpp = false; reconnectTask?.cancel(); reconnectTask = nil; sdrppConnecting = false; ensureInitialized(); _ = command(["cmd":"stop"]); audio.stop(); spectrum.removeAll(); waterfall.removeAll(); refresh() }; func updateSatellites() { ensureInitialized(); _ = command(["cmd":"sat_update"]); refresh() }
+    func start() { guard wantsSdrpp else { lastError = "Conecte ao SDR++ em Settings antes de iniciar o receptor."; return }; ensureInitialized(); _ = command(["cmd":"start"]); audio.start(); audio.setVolume(volume); refresh() }; func stop() { wantsSdrpp = false; reconnectTask?.cancel(); reconnectTask = nil; sdrppConnecting = false; ensureInitialized(); _ = command(["cmd":"stop"]); audio.stop(); spectrum.removeAll(); waterfall.removeAll(); refresh() }; func updateSatellites() { ensureInitialized(); _ = command(["cmd":"sat_update"]); refresh() }
     func configureSdrpp(host: String, port: Int) {
         ensureInitialized()
         guard !wantsSdrpp else { return }

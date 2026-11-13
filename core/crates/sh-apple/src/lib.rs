@@ -31,7 +31,7 @@ fn output_string(value: String) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn sh_apple_init(data_dir: *const c_char) -> bool {
+pub extern "C" fn sdr_outdoor_apple_init(data_dir: *const c_char) -> bool {
     catch(false, || {
         let Some(data_dir) = input_string(data_dir) else {
             return false;
@@ -42,7 +42,7 @@ pub extern "C" fn sh_apple_init(data_dir: *const c_char) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn sh_apple_command(json: *const c_char) -> *mut c_char {
+pub extern "C" fn sdr_outdoor_apple_command(json: *const c_char) -> *mut c_char {
     catch(ptr::null_mut(), || {
         let Some(json) = input_string(json) else {
             return output_string(r#"{"ok":false,"error":"invalid command"}"#.into());
@@ -56,7 +56,7 @@ pub extern "C" fn sh_apple_command(json: *const c_char) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn sh_apple_string_free(value: *mut c_char) {
+pub extern "C" fn sdr_outdoor_apple_string_free(value: *mut c_char) {
     if !value.is_null() {
         // SAFETY: value must have been returned by output_string and may be freed once.
         unsafe { drop(CString::from_raw(value)) };
@@ -65,7 +65,7 @@ pub extern "C" fn sh_apple_string_free(value: *mut c_char) {
 
 /// Returns `(row_count << 16) | (bin_count / 16)`, matching the Android bridge.
 #[no_mangle]
-pub extern "C" fn sh_apple_spectrum_rows(
+pub extern "C" fn sdr_outdoor_apple_spectrum_rows(
     output: *mut f32,
     output_len: usize,
     metadata: *mut f64,
@@ -85,7 +85,7 @@ pub extern "C" fn sh_apple_spectrum_rows(
 }
 
 #[no_mangle]
-pub extern "C" fn sh_apple_audio(output: *mut f32, output_len: usize) -> usize {
+pub extern "C" fn sdr_outdoor_apple_audio(output: *mut f32, output_len: usize) -> usize {
     catch(0, || {
         if output.is_null() {
             return 0;

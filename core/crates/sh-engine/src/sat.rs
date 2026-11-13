@@ -1,4 +1,4 @@
-//! Cubesat Hunter state: satellite data on disk, pass list, the selected satellite's pass,
+//! SDR Outdoor satellite state: satellite data on disk, pass list, the selected satellite's pass,
 //! its radar track and the satellites overhead.
 
 use serde::Serialize;
@@ -181,7 +181,7 @@ pub fn download(root: &Path, mut progress: impl FnMut(&str)) -> String {
     for (file, url) in db::sources() {
         progress(file);
         let r = (|| -> Result<usize, String> {
-            let mut resp = ureq::get(url).header("User-Agent", "SatHunterSDR").call().map_err(|e| e.to_string())?;
+            let mut resp = ureq::get(url).header("User-Agent", "SDR Outdoor").call().map_err(|e| e.to_string())?;
             let body = resp.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| e.to_string())?;
             if body.len() < 16 {
                 return Err("empty reply".into());

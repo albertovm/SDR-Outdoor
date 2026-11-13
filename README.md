@@ -1,5 +1,7 @@
 # SDR Outdoor
 
+Desenvolvedor: **Alberto V M**.
+
 Aplicativo nativo para iPhone e iPad que recebe IQ pela rede de um servidor SDR++, mostra espectro e waterfall, reproduz áudio e oferece sintonia, filtros, modos NFM/WFM/AM/USB/LSB/CW e funções de rastreio de satélites.
 
 ## Estrutura
@@ -10,8 +12,8 @@ Aplicativo nativo para iPhone e iPad que recebe IQ pela rede de um servidor SDR+
 
 ## Abrir e compilar
 
-1. Abra `apple/SatHunterApp.xcodeproj` no Xcode.
-2. Escolha o esquema `SatHunterApp` e um iPhone ou iPad com iOS/iPadOS 18 ou superior.
+1. Abra `apple/SDROutdoorApp.xcodeproj` no Xcode.
+2. Escolha o esquema `SDROutdoorApp` e um iPhone ou iPad com iOS/iPadOS 18 ou superior.
 3. Para aparelho físico, configure sua equipe de assinatura no alvo do aplicativo.
 4. Compile e execute. O XCFramework incluído contém bibliotecas para Apple Silicon Simulator e dispositivos arm64.
 
@@ -25,4 +27,4 @@ Na tela **Receiver**, toque em **Alterar** para digitar a frequência em hertz. 
 
 ## Origem e licença
 
-Este projeto deriva de [SatHunter-SDR](https://github.com/z2labs/SatHunter-SDR) e da adaptação para iOS/iPadOS em [SatHunterSDR-iOSiPad](https://github.com/albertovm/SatHunterSDR-iOSiPad). O código original de Zoltan Doczi e as modificações permanecem sob GPL-3.0-or-later; veja [LICENSE](LICENSE). A dependência vendorizada `core/third_party/rtl-sdr-rs` mantém sua licença própria no respectivo diretório.
+O código tem origem em trabalhos anteriores de Zoltan Doczi e na adaptação iOS/iPadOS mantida por Alberto V M. Os créditos e links históricos estão em [ATTRIBUTION.md](ATTRIBUTION.md). O código permanece sob GPL-3.0-or-later; veja [LICENSE](LICENSE). A dependência vendorizada `core/third_party/rtl-sdr-rs` mantém sua licença própria no respectivo diretório.

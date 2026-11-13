@@ -228,9 +228,9 @@ fn reply(rq: tiny_http::Request, code: u16, v: &Value) {
     let _ = rq.respond(tiny_http::Response::from_string(v.to_string()).with_status_code(code).with_header(h));
 }
 
-const HELP: &str = "<!doctype html><meta charset=utf-8><title>SatHunterSDR lab link</title>\
+const HELP: &str = "<!doctype html><meta charset=utf-8><title>SDR Outdoor lab link</title>\
 <body style='font-family:monospace;background:#0a0f16;color:#5ae08c;padding:16px'>\
-<h3>SatHunterSDR lab link</h3><p>The phone shows its address and PIN on the lab console.</p>\
+<h3>SDR Outdoor lab link</h3><p>The phone shows its address and PIN on the lab console.</p>\
 <p>On the PC: <b>python tools/lab/lab.py --phone &lt;address&gt; --pin &lt;PIN&gt;</b></p>\
 <p>JSON API (PIN as ?pin= or X-Lab-Pin): /status, POST /cmd, /measure?hz=&amp;bw=&amp;secs=, /cw?secs=, /iq?secs=, /audio?secs=, POST /phase, POST /log, /log</p></body>";
 

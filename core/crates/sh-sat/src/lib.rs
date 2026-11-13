@@ -1,4 +1,4 @@
-//! SatHunterSDR satellite logic: SatNOGS / CelesTrak data, SGP4 orbits, passes, Doppler
+//! SDR Outdoor satellite logic: SatNOGS / CelesTrak data, SGP4 orbits, passes, Doppler
 //! tracking and Maidenhead locators. Platform independent, no I/O.
 
 pub mod db;

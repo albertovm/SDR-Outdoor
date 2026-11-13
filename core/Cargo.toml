@@ -6,7 +6,7 @@ members = ["crates/sh-apple", "crates/sh-dsp", "crates/sh-engine", "crates/sh-pl
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-authors = ["Zoltan Doczi"]
+authors = ["Alberto V M"]
 repository = "https://github.com/albertovm/SDR-Outdoor"
 
 [workspace.dependencies]

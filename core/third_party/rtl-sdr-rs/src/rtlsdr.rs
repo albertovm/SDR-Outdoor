@@ -126,7 +126,7 @@ impl RtlSdr {
         // Hack to force the Bias T to always be on if we set the IR-Endpoint bit in the EEPROM to 0. Default on EEPROM is 1.
         let mut buf: [u8; EEPROM_SIZE] = [0; EEPROM_SIZE];
         // Only a valid RTL2832 EEPROM (header 0x28 0x32) counts: a failed or blank read (zeros)
-        // would otherwise read as "force bias tee" and keep the bias tee on for good (SatHunterSDR)
+        // would otherwise read as "force bias tee" and keep the bias tee on for good (SDR Outdoor)
         let ok = self.handle.read_eeprom(&mut buf, 0, EEPROM_SIZE).is_ok() && buf[0] == 0x28 && buf[1] == 0x32;
         info!("EEPROM header {:02x} {:02x}, byte 7 {:02x} ({})", buf[0], buf[1], buf[7], if ok { "valid" } else { "ignored" });
         self.eeprom7 = if ok { Some(buf[7]) } else { None };

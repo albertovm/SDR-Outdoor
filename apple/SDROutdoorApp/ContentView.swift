@@ -2,10 +2,37 @@ import MapKit
 import SwiftUI
 
 private struct SdrppServerSection: View {
-    @EnvironmentObject private var engine: SatHunterEngine
+    @EnvironmentObject private var engine: SDROutdoorEngine
     @AppStorage("sdrppHost") private var host = "127.0.0.1"
     @AppStorage("sdrppPort") private var port = 5259
-    var body: some View { Section("Servidor SDR++") { TextField("Endereço/IP", text: $host).textInputAutocapitalization(.never).autocorrectionDisabled(); Stepper("Porta: \(port)", value: $port, in: 1...65535); let source = engine.status["source"] as? String ?? "sdrpp"; let sourceStatus = engine.status["source_status"] as? String ?? "sem estado"; let connected = engine.sdrppRequested; Button(connected ? (engine.sdrppConnecting ? "Reconectando… Desconectar" : "Desconectar do SDR++") : "Conectar ao SDR++") { if connected { engine.disconnectSdrpp() } else { engine.configureSdrpp(host: host, port: port) } }; HStack { Circle().fill(sourceStatus.hasPrefix("Recebendo IQ") ? .green : .orange).frame(width: 9, height: 9); Text(source == "sdrpp" ? "Fonte SDR++: \(sourceStatus)" : "Fonte atual: \(source)").font(.caption) }; Text("Destino: \(host):\(port)").font(.caption2).foregroundStyle(.secondary); if let error = engine.lastError { Text("Erro SDR++: \(error)").font(.caption).foregroundStyle(.red).textSelection(.enabled) }; Text("No simulador, 127.0.0.1 é o próprio simulador. Para o SDR++ no Mac, use o IP do Mac na rede (por exemplo, 192.168.2.250) e a porta 5259/TCP.").font(.footnote).foregroundStyle(.secondary) } }
+
+    var body: some View {
+        Section("Servidor SDR++") {
+            TextField("Endereço/IP", text: $host)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Stepper("Porta: \(port)", value: $port, in: 1...65535)
+            Button(engine.sdrppRequested ? "Desconectar do SDR++" : "Conectar ao SDR++") {
+                if engine.sdrppRequested { engine.disconnectSdrpp() }
+                else { engine.configureSdrpp(host: host, port: port) }
+            }
+            HStack {
+                Circle().fill(engine.sdrppRequested ? (receivingIQ ? .green : .orange) : .red)
+                    .frame(width: 9, height: 9)
+                Text(engine.sdrppRequested ? (engine.status["source_status"] as? String ?? "Conectando…") : "SDR++ desconectado")
+                    .font(.caption)
+            }
+            Text("Destino: \(host):\(port) • conexão manual")
+                .font(.caption2).foregroundStyle(.secondary)
+            if let error = engine.lastError {
+                Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+            }
+        }
+    }
+
+    private var receivingIQ: Bool {
+        (engine.status["source_status"] as? String ?? "").hasPrefix("Recebendo IQ")
+    }
 }
 
 private struct FrequencyDisplay: View {
@@ -30,27 +57,21 @@ private struct FrequencyDisplay: View {
 }
 
 struct ContentView: View {
-    @EnvironmentObject private var engine: SatHunterEngine
+    @EnvironmentObject private var engine: SDROutdoorEngine
     var body: some View { TabView() { ReceiverScreenView().tabItem { Label("Receiver", systemImage: "radio") }; SatellitesView().tabItem { Label("Satellites", systemImage: "dot.radiowaves.left.and.right") }; SettingsView().tabItem { Label("Settings", systemImage: "gearshape.fill") } }.tint(Color(red: 0.32, green: 0.70, blue: 1.0)).preferredColorScheme(.dark).task { engine.bootstrap() } }
 }
-private struct ReceiverView: View {
-    @EnvironmentObject private var engine: SatHunterEngine
-    var running: Bool { engine.status["running"] as? Bool ?? false }; var source: String { engine.status["source"] as? String ?? "desconhecida" }; var mode: String { engine.status["mode"] as? String ?? "WFM" }; var hz: Double { engine.status["vfo_hz"] as? Double ?? 0 }
-    var body: some View { NavigationStack { ScrollView { VStack(alignment: .leading, spacing: 10) { HStack { SatHunterLogo().frame(width: 42, height: 42); FrequencyDisplay(hz: hz); Spacer(); Circle().fill(running ? .green : .red).frame(width: 10) }; Text("\(mode)  •  \(source)").foregroundStyle(.secondary).font(.caption); HStack { Button("−") { engine.tune(hz - 12500) }.buttonStyle(.bordered); Button(running ? "■" : "▶") { running ? engine.stop() : engine.start() }.buttonStyle(.borderedProminent); Button("+") { engine.tune(hz + 12500) }.buttonStyle(.bordered) }.frame(maxWidth: .infinity); ZStack { SpectrumView(values: engine.spectrum, centerHz: hz) { engine.tune($0) }; FrequencyScaleOverlay(centerHz: hz, mode: mode); SatelliteMarkerOverlay(rows: engine.satelliteRows, centerHz: hz) { row in if let n = row["norad"] as? Int { engine.select(n) }; if let f = row["freq"] as? Double { engine.tune(f) } } }.frame(height: 150)
-                WaterfallView(rows: engine.waterfall, centerHz: hz) { engine.tune($0) }.frame(height: 180).background(Color.black).clipShape(RoundedRectangle(cornerRadius: 12)).overlay { SatelliteMarkerOverlay(rows: engine.satelliteRows, centerHz: hz) { row in if let n = row["norad"] as? Int { engine.select(n) }; if let f = row["freq"] as? Double { engine.tune(f) } } }; RadarView(azimuth: engine.detail["az"] as? Double ?? 0, elevation: engine.detail["el"] as? Double ?? 0).frame(height: 220).background(Color.black).clipShape(RoundedRectangle(cornerRadius: 12)); HStack { Button(running ? "Parar" : "Iniciar") { running ? engine.stop() : engine.start() }.buttonStyle(.borderedProminent);  }; HStack(spacing: 4) { ForEach(["NFM","WFM","AM","USB","LSB","CW"], id: \.self) { item in Button(item) { engine.setMode(item) }.buttonStyle(.borderedProminent).tint(mode == item ? .blue : .gray) } }.lineLimit(1); HStack { Button("Volume −") { engine.changeVolume(-0.1) }; Text("Vol \(Int(engine.volume * 100))%"); Button("Volume +") { engine.changeVolume(0.1) } }; HStack { RecordButton(engine: engine, active: engine.status["recording"] != nil); HStack { DecoderButton(title: "APRS", key: "aprs", status: engine.status["aprs"] as? [String:Any] ?? [:], engine: engine); DecoderButton(title: "SSTV", key: "sstv", status: engine.status["sstv"] as? [String:Any] ?? [:], engine: engine); DecoderButton(title: "FSK 9k6", key: "fsk9k6", status: engine.status["fsk9k6"] as? [String:Any] ?? [:], engine: engine) }; }; Text("APRS: \((engine.status["aprs"] as? [String:Any])?["count"] as? Int ?? 0) frames • SSTV: \((engine.status["sstv"] as? [String:Any])?["rows"] as? Int ?? 0) linhas • FSK: \((engine.status["fsk9k6"] as? [String:Any])?["count"] as? Int ?? 0) frames").font(.caption).foregroundStyle(.secondary); Text(((engine.status["plugins"] as? [String]) ?? []).suffix(3).joined(separator: "\n")).font(.caption2).foregroundStyle(.secondary); Text("Estado do núcleo").font(.headline); Text(engine.status["source_status"] as? String ?? (running ? "Executando" : "Parado")).frame(maxWidth: .infinity, alignment: .leading).padding().background(.thinMaterial).clipShape(RoundedRectangle(cornerRadius: 12)); if let err = engine.lastError { Text(err).foregroundStyle(.red) } }.padding() }.navigationTitle("SatHunter SDR") } }
-}
-private struct SatellitesView: View { @EnvironmentObject private var engine: SatHunterEngine; @State private var search = ""; @State private var favouritesOnly = false; @State private var band = "Todas"; @State private var selectedNorad: Int?; var filtered: [Int] { engine.satelliteRows.indices.filter { (search.isEmpty || (engine.satelliteRows[$0]["name"] as? String ?? "").localizedCaseInsensitiveContains(search)) && (!favouritesOnly || (engine.satelliteRows[$0]["fav"] as? Bool ?? false)) && (band == "Todas" || (engine.satelliteRows[$0]["bands"] as? String ?? "").localizedCaseInsensitiveContains(band)) } }; var body: some View { NavigationSplitView { List(selection: $selectedNorad) { TextField("Buscar satélite", text: $search); Button("Atualizar dados dos satélites") { engine.updateSatellites() }; Toggle("Somente favoritos", isOn: $favouritesOnly); Picker("Banda", selection: $band) { ForEach(["Todas", "TwoM", "SeventyCm", "SBand", "ThirteenCm"], id: \.self) { Text($0).tag($0) } }; ForEach(filtered, id: \.self) { i in let row = engine.satelliteRows[i]; let name = row["name"] as? String ?? "Satélite"; let norad = row["norad"] as? Int ?? 0; HStack { Button { selectedNorad = norad; engine.select(norad) } label: { VStack(alignment: .leading) { Text(name); Text("NORAD \(norad)").font(.caption).foregroundStyle(.secondary) } }.buttonStyle(.plain); Spacer(); Button { engine.favourite(norad, on: !(row["fav"] as? Bool ?? false)) } label: { Image(systemName: (row["fav"] as? Bool ?? false) ? "star.fill" : "star").foregroundStyle(.yellow) }.buttonStyle(.plain) }.tag(norad) } }.navigationTitle("Satélites") } detail: { SatelliteDetailView() }.onChange(of: selectedNorad) { _, value in if let value { engine.select(value) } } } }
- private struct SatelliteDetailView: View { @EnvironmentObject private var engine: SatHunterEngine
+private struct SatellitesView: View { @EnvironmentObject private var engine: SDROutdoorEngine; @State private var search = ""; @State private var favouritesOnly = false; @State private var band = "Todas"; @State private var selectedNorad: Int?; var filtered: [Int] { engine.satelliteRows.indices.filter { (search.isEmpty || (engine.satelliteRows[$0]["name"] as? String ?? "").localizedCaseInsensitiveContains(search)) && (!favouritesOnly || (engine.satelliteRows[$0]["fav"] as? Bool ?? false)) && (band == "Todas" || (engine.satelliteRows[$0]["bands"] as? String ?? "").localizedCaseInsensitiveContains(band)) } }; var body: some View { NavigationSplitView { List(selection: $selectedNorad) { TextField("Buscar satélite", text: $search); Button("Atualizar dados dos satélites") { engine.updateSatellites() }; Toggle("Somente favoritos", isOn: $favouritesOnly); Picker("Banda", selection: $band) { ForEach(["Todas", "TwoM", "SeventyCm", "SBand", "ThirteenCm"], id: \.self) { Text($0).tag($0) } }; ForEach(filtered, id: \.self) { i in let row = engine.satelliteRows[i]; let name = row["name"] as? String ?? "Satélite"; let norad = row["norad"] as? Int ?? 0; HStack { Button { selectedNorad = norad; engine.select(norad) } label: { VStack(alignment: .leading) { Text(name); Text("NORAD \(norad)").font(.caption).foregroundStyle(.secondary) } }.buttonStyle(.plain); Spacer(); Button { engine.favourite(norad, on: !(row["fav"] as? Bool ?? false)) } label: { Image(systemName: (row["fav"] as? Bool ?? false) ? "star.fill" : "star").foregroundStyle(.yellow) }.buttonStyle(.plain) }.tag(norad) } }.navigationTitle("Satélites") } detail: { SatelliteDetailView() }.onChange(of: selectedNorad) { _, value in if let value { engine.select(value) } } } }
+ private struct SatelliteDetailView: View { @EnvironmentObject private var engine: SDROutdoorEngine
     var look: [String: Any] { engine.detail["look"] as? [String: Any] ?? [:] }
     var body: some View { ScrollView { VStack(alignment: .leading, spacing: 12) { Text(engine.detail["name"] as? String ?? "Selecione um satélite").font(.title2.bold()); Text("Azimute: \(String(format: "%.1f°", look["az"] as? Double ?? 0)) • Elevação: \(String(format: "%.1f°", look["el"] as? Double ?? 0))"); if let txs = engine.detail["tx"] as? [[String: Any]], !txs.isEmpty { Text("Downlinks").font(.headline); ForEach(Array(txs.enumerated()), id: \.offset) { _, tx in let uuid = tx["uuid"] as? String ?? ""; let freq = tx["freq"] as? Double ?? tx["low"] as? Double ?? 0; Button { if let norad = engine.detail["selected"] as? Int { engine.select(norad, tx: uuid) } } label: { HStack { VStack(alignment: .leading) { Text(tx["description"] as? String ?? tx["mode"] as? String ?? "Transmissor"); Text(String(format: "%.3f MHz • %@", freq / 1e6, tx["mode"] as? String ?? "")).font(.caption).foregroundStyle(.secondary) }; Spacer(); Image(systemName: (tx["matches"] as? Bool ?? false) ? "checkmark.circle.fill" : "circle") } }.buttonStyle(.plain) } }; RadarView(azimuth: look["az"] as? Double ?? 0, elevation: look["el"] as? Double ?? 0, heading: engine.heading).frame(height: 220).background(Color.black).clipShape(RoundedRectangle(cornerRadius: 12)); if let sub = engine.detail["sub"] as? [String: Any] { let ground = (engine.detail["ground"] as? [[Any]] ?? []).compactMap { p -> [Double]? in guard p.count >= 2, let lat = p[0] as? Double, let lon = p[1] as? Double else { return nil }; return [lat, lon] }; MapOverview(latitude: sub["lat"] as? Double ?? 0, longitude: sub["lon"] as? Double ?? 0, ground: ground, pins: engine.pluginPins).frame(height: 180).clipShape(RoundedRectangle(cornerRadius: 12)) }; let tracking = engine.detail["tracking"] as? Bool ?? false; Button(tracking ? "Parar rastreio" : "Começar rastreio") { engine.track(!tracking) }.buttonStyle(.borderedProminent) }.padding() } }
 }
-private struct SettingsView: View { @EnvironmentObject private var engine: SatHunterEngine; var pluginsOn: Bool { (engine.status["plugins"] as? [String: Any])?["on"] as? Bool ?? true }; var centerTuningOn: Bool { engine.status["center_tuning"] as? Bool ?? false }; var body: some View { NavigationStack { Form { SdrppServerSection(); Section("Fonte") { Button("Ativar localização") { engine.location.request(); engine.location.start() }; Button((engine.status["follow_gps"] as? Bool ?? false) ? "Parar seguir GPS" : "Seguir GPS") { engine.setting("follow_gps", ["on": !(engine.status["follow_gps"] as? Bool ?? false)]) }; Toggle("Sintonia central", isOn: Binding(get: { centerTuningOn }, set: { engine.setting("center_tuning", ["on": $0]) })); Toggle("Plugins de decodificação", isOn: Binding(get: { pluginsOn }, set: { engine.plugins($0) })); Button("Bias-tee") { engine.setting("bias_tee", ["on": true]) }.disabled(!(engine.status["has_bias_tee"] as? Bool ?? false)); Text("USB direto no iPad exige uma camada DriverKit ou fonte de rede.").font(.footnote).foregroundStyle(.secondary) }; GroundAprsSection(engine: engine); DebugLabSection(engine: engine); AdvancedDSPSection(engine: engine); Section("Espectro") { HStack { ForEach([1, 2, 4, 8], id: \.self) { value in Button("\(value)×") { engine.setDecimation(value) }.buttonStyle(.borderedProminent).tint((engine.status["decimation"] as? Int ?? 1) == value ? .blue : .gray) } }; Text("Decimação reduz a largura processada e destaca sinais fracos.").font(.footnote).foregroundStyle(.secondary) }; Section("Diagnóstico") { Text("Satélites carregados: \(engine.satelliteRows.count)"); Text("Núcleo: \(engine.status.isEmpty ? "não inicializado" : "pronto")"); Text("Taxa: \(String(format: "%.1f MS/s", (engine.status["rate"] as? Double ?? 0) / 1e6))"); Text("Nível: \(String(format: "%.1f dB", engine.status["level_db"] as? Double ?? -120))"); Text("Bússola: \(String(format: "%.0f°", engine.heading))"); HStack { Button("Ganho −") { let g = engine.status["gain"] as? Double ?? 0; engine.setting("gain", ["db": g - 1]) }; Text("Ganho: \(String(format: "%.1f dB", engine.status["gain"] as? Double ?? 0))"); Button("Ganho +") { let g = engine.status["gain"] as? Double ?? 0; engine.setting("gain", ["db": g + 1]) } }; HStack { Button("PPM −") { let p = engine.status["ppm"] as? Double ?? 0; engine.setting("ppm", ["ppm": p - 1]) }; Text("PPM: \(String(format: "%.0f", engine.status["ppm"] as? Double ?? 0))"); Button("PPM +") { let p = engine.status["ppm"] as? Double ?? 0; engine.setting("ppm", ["ppm": p + 1]) } } } } }.navigationTitle("Configurações") } }
+private struct SettingsView: View { @EnvironmentObject private var engine: SDROutdoorEngine; var pluginsOn: Bool { (engine.status["plugins"] as? [String: Any])?["on"] as? Bool ?? true }; var centerTuningOn: Bool { engine.status["center_tuning"] as? Bool ?? false }; var body: some View { NavigationStack { Form { SdrppServerSection(); Section("Fonte") { Button("Ativar localização") { engine.location.request(); engine.location.start() }; Button((engine.status["follow_gps"] as? Bool ?? false) ? "Parar seguir GPS" : "Seguir GPS") { engine.setting("follow_gps", ["on": !(engine.status["follow_gps"] as? Bool ?? false)]) }; Toggle("Sintonia central", isOn: Binding(get: { centerTuningOn }, set: { engine.setting("center_tuning", ["on": $0]) })); Toggle("Plugins de decodificação", isOn: Binding(get: { pluginsOn }, set: { engine.plugins($0) })); Button("Bias-tee") { engine.setting("bias_tee", ["on": true]) }.disabled(!(engine.status["has_bias_tee"] as? Bool ?? false)); Text("USB direto no iPad exige uma camada DriverKit ou fonte de rede.").font(.footnote).foregroundStyle(.secondary) }; GroundAprsSection(engine: engine); DebugLabSection(engine: engine); AdvancedDSPSection(engine: engine); Section("Espectro") { HStack { ForEach([1, 2, 4, 8], id: \.self) { value in Button("\(value)×") { engine.setDecimation(value) }.buttonStyle(.borderedProminent).tint((engine.status["decimation"] as? Int ?? 1) == value ? .blue : .gray) } }; Text("Decimação reduz a largura processada e destaca sinais fracos.").font(.footnote).foregroundStyle(.secondary) }; Section("Diagnóstico") { Text("Satélites carregados: \(engine.satelliteRows.count)"); Text("Núcleo: \(engine.status.isEmpty ? "não inicializado" : "pronto")"); Text("Taxa: \(String(format: "%.1f MS/s", (engine.status["rate"] as? Double ?? 0) / 1e6))"); Text("Nível: \(String(format: "%.1f dB", engine.status["level_db"] as? Double ?? -120))"); Text("Bússola: \(String(format: "%.0f°", engine.heading))"); HStack { Button("Ganho −") { let g = engine.status["gain"] as? Double ?? 0; engine.setting("gain", ["db": g - 1]) }; Text("Ganho: \(String(format: "%.1f dB", engine.status["gain"] as? Double ?? 0))"); Button("Ganho +") { let g = engine.status["gain"] as? Double ?? 0; engine.setting("gain", ["db": g + 1]) } }; HStack { Button("PPM −") { let p = engine.status["ppm"] as? Double ?? 0; engine.setting("ppm", ["ppm": p - 1]) }; Text("PPM: \(String(format: "%.0f", engine.status["ppm"] as? Double ?? 0))"); Button("PPM +") { let p = engine.status["ppm"] as? Double ?? 0; engine.setting("ppm", ["ppm": p + 1]) } } } } }.navigationTitle("Configurações") } }
 
-private struct GroundAprsSection: View { let engine: SatHunterEngine; var active: Bool { (engine.status["ground_aprs"] as? [String: Any])?["on"] as? Bool ?? false }; var hz: Double { (engine.status["ground_aprs"] as? [String: Any])?["hz"] as? Double ?? 144.8e6; }; var body: some View { Section("APRS terrestre") { Toggle("Escutar APRS sem rastrear satélite", isOn: Binding(get: { active }, set: { engine.groundAprs($0, hz: hz) })); HStack { ForEach([144.39e6, 144.8e6, 145.825e6], id: \.self) { value in Button(String(format: "%.3f MHz", value / 1e6)) { engine.groundAprs(true, hz: value) }.buttonStyle(.borderedProminent).tint(abs(hz - value) < 1 ? .blue : .gray) } }.disabled(!active); Text("Modo fixo NFM/AFSK 1200; iniciar o rastreio de um satélite encerra este modo.").font(.footnote).foregroundStyle(.secondary) } } }
+private struct GroundAprsSection: View { let engine: SDROutdoorEngine; var active: Bool { (engine.status["ground_aprs"] as? [String: Any])?["on"] as? Bool ?? false }; var hz: Double { (engine.status["ground_aprs"] as? [String: Any])?["hz"] as? Double ?? 144.8e6; }; var body: some View { Section("APRS terrestre") { Toggle("Escutar APRS sem rastrear satélite", isOn: Binding(get: { active }, set: { engine.groundAprs($0, hz: hz) })); HStack { ForEach([144.39e6, 144.8e6, 145.825e6], id: \.self) { value in Button(String(format: "%.3f MHz", value / 1e6)) { engine.groundAprs(true, hz: value) }.buttonStyle(.borderedProminent).tint(abs(hz - value) < 1 ? .blue : .gray) } }.disabled(!active); Text("Modo fixo NFM/AFSK 1200; iniciar o rastreio de um satélite encerra este modo.").font(.footnote).foregroundStyle(.secondary) } } }
 
-private struct DebugLabSection: View { let engine: SatHunterEngine; @State private var pin = ""; var debug: Bool { engine.status["debug_mode"] as? Bool ?? false }; var body: some View { Section("Diagnóstico e laboratório") { Toggle("Modo debug / console LAN", isOn: Binding(get: { debug }, set: { engine.debugMode($0) })); HStack { TextField("PIN (4–8 dígitos)", text: $pin).keyboardType(.numberPad); Button("Definir") { engine.labPin(pin) } }; if let lab = engine.status["lab"] as? [String: Any], let address = lab["address"] as? String { Text("Console: \(address)").font(.footnote).foregroundStyle(.secondary) }; Text("GPS: \(engine.gpsText)").font(.footnote).foregroundStyle(.secondary); Text("O console permite medições e testes do receptor pela rede local.").font(.footnote).foregroundStyle(.secondary) } } }
+private struct DebugLabSection: View { let engine: SDROutdoorEngine; @State private var pin = ""; var debug: Bool { engine.status["debug_mode"] as? Bool ?? false }; var body: some View { Section("Diagnóstico e laboratório") { Toggle("Modo debug / console LAN", isOn: Binding(get: { debug }, set: { engine.debugMode($0) })); HStack { TextField("PIN (4–8 dígitos)", text: $pin).keyboardType(.numberPad); Button("Definir") { engine.labPin(pin) } }; if let lab = engine.status["lab"] as? [String: Any], let address = lab["address"] as? String { Text("Console: \(address)").font(.footnote).foregroundStyle(.secondary) }; Text("GPS: \(engine.gpsText)").font(.footnote).foregroundStyle(.secondary); Text("O console permite medições e testes do receptor pela rede local.").font(.footnote).foregroundStyle(.secondary) } } }
 
-private struct AdvancedDSPSection: View { let engine: SatHunterEngine; var body: some View { Section("DSP avançado") { Text("Largura de banda"); HStack { ForEach([12500.0, 25000.0, 200000.0], id: \.self) { value in Button(String(format: "%.1f kHz", value / 1000)) { engine.bandwidth(value) }.buttonStyle(.borderedProminent) } }; Text("Taxa de amostragem"); HStack { ForEach([1.0e6, 2.0e6, 2.4e6], id: \.self) { value in Button(String(format: "%.1f MS/s", value / 1e6)) { engine.sampleRate(value) }.buttonStyle(.bordered) } }; HStack { Button("Simular passagem") { engine.simulatePass() }; Button("Tempo real") { engine.realTime() } }; Button("Resetar offset Doppler") { engine.resetDopplerOffset() } } } }
+private struct AdvancedDSPSection: View { let engine: SDROutdoorEngine; var body: some View { Section("DSP avançado") { Text("Largura de banda"); HStack { ForEach([12500.0, 25000.0, 200000.0], id: \.self) { value in Button(String(format: "%.1f kHz", value / 1000)) { engine.bandwidth(value) }.buttonStyle(.borderedProminent) } }; Text("Taxa de amostragem"); HStack { ForEach([1.0e6, 2.0e6, 2.4e6], id: \.self) { value in Button(String(format: "%.1f MS/s", value / 1e6)) { engine.sampleRate(value) }.buttonStyle(.bordered) } }; HStack { Button("Simular passagem") { engine.simulatePass() }; Button("Tempo real") { engine.realTime() } }; Button("Resetar offset Doppler") { engine.resetDopplerOffset() } } } }
 
 private struct SatelliteMarkerOverlay: View { let rows: [[String: Any]]; let centerHz: Double; let onSelect: ([String: Any]) -> Void; var body: some View { GeometryReader { geo in ForEach(Array(rows.prefix(24).enumerated()), id: \.offset) { _, row in if let f = row["freq"] as? Double, f > 0 { let x = geo.size.width * (0.5 + CGFloat((f - centerHz) / 2_000_000)); if x >= 0 && x <= geo.size.width { VStack(spacing: 2) { Rectangle().fill(.yellow.opacity(0.7)).frame(width: 1); Text(row["name"] as? String ?? "SAT").font(.system(size: 8, weight: .semibold)).foregroundStyle(.yellow).lineLimit(1).frame(maxWidth: 72) }.position(x: x, y: geo.size.height / 2).contentShape(Rectangle()).onTapGesture { onSelect(row) } } } } } } }
 
@@ -60,13 +81,14 @@ private struct FrequencyScaleOverlay: View {
     let rateHz: Double
     let vfoHz: Double
     let bandwidthHz: Double
+    let zoom: CGFloat
     let showScale: Bool
-    init(centerHz: Double, mode: String, rateHz: Double = 2_000_000, vfoHz: Double? = nil, bandwidthHz: Double = 12_500, showScale: Bool = true) { self.centerHz = centerHz; self.mode = mode; self.rateHz = rateHz; self.vfoHz = vfoHz ?? centerHz; self.bandwidthHz = bandwidthHz; self.showScale = showScale }
+    init(centerHz: Double, mode: String, rateHz: Double = 2_000_000, vfoHz: Double? = nil, bandwidthHz: Double = 12_500, zoom: CGFloat = 1, showScale: Bool = true) { self.centerHz = centerHz; self.mode = mode; self.rateHz = rateHz; self.vfoHz = vfoHz ?? centerHz; self.bandwidthHz = bandwidthHz; self.zoom = zoom; self.showScale = showScale }
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                let markerX = geo.size.width * CGFloat(0.5 + (vfoHz - centerHz) / max(rateHz, 1))
-                let filterWidth = max(3, geo.size.width * CGFloat(bandwidthHz / max(rateHz, 1)))
+                let markerX = geo.size.width * CGFloat(0.5 + (vfoHz - centerHz) / max(rateHz, 1) * Double(zoom))
+                let filterWidth = max(3, geo.size.width * CGFloat(bandwidthHz / max(rateHz, 1)) * zoom)
                 let filterOffset = (mode == "USB" ? filterWidth / 2 : mode == "LSB" ? -filterWidth / 2 : 0)
                 Rectangle().fill(.blue.opacity(0.24)).frame(width: filterWidth, height: geo.size.height).position(x: markerX + filterOffset, y: geo.size.height / 2)
                 Rectangle().fill(.red).frame(width: 2).position(x: markerX, y: geo.size.height / 2)
@@ -74,7 +96,7 @@ private struct FrequencyScaleOverlay: View {
                     ForEach(-2...2, id: \.self) { tick in
                         VStack(spacing: 2) {
                             Rectangle().fill(.white.opacity(0.5)).frame(width: 1, height: 7)
-                            Text(String(format: "%.3f", (centerHz + Double(tick) * rateHz / 4) / 1e6)).font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.8))
+                            Text(String(format: "%.3f", (centerHz + Double(tick) * rateHz / (4 * Double(zoom))) / 1e6)).font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.8))
                         }.frame(maxWidth: .infinity)
                     }
                 }.frame(maxHeight: .infinity, alignment: .bottom)
@@ -84,10 +106,30 @@ private struct FrequencyScaleOverlay: View {
     }
 }
 
-private struct SpectrumView: View { let values: [Float]; let centerHz: Double; let rateHz: Double; let onTune: (Double) -> Void; @State private var dragHz: Double?; @State private var zoom: CGFloat = 1; @State private var baseZoom: CGFloat = 1; var body: some View { GeometryReader { geo in Path { path in guard values.count > 1 else { return }; let lo: Float = -130; let hi: Float = -25; for i in values.indices { let rawX = CGFloat(i) / CGFloat(values.count - 1); let x = geo.size.width * (0.5 + (rawX - 0.5) / zoom); let y = geo.size.height * CGFloat(1 - (min(hi, max(lo, values[i])) - lo) / (hi - lo)); if i == values.startIndex { path.move(to: CGPoint(x:x,y:y)) } else { path.addLine(to: CGPoint(x:x,y:y)) } } }.stroke(.green, lineWidth: 1.5).contentShape(Rectangle()).gesture(DragGesture(minimumDistance: 0).onChanged { value in let normalized = Double(value.location.x / max(1, geo.size.width)) - 0.5; dragHz = centerHz + normalized * rateHz / Double(zoom) }.onEnded { _ in if let f = dragHz { onTune(f) }; dragHz = nil }).simultaneousGesture(MagnificationGesture().onChanged { value in zoom = min(16, max(1, baseZoom * value)) }.onEnded { _ in baseZoom = zoom }) } } }
-
-private extension SpectrumView {
-    init(values: [Float], centerHz: Double, onTune: @escaping (Double) -> Void) { self.init(values: values, centerHz: centerHz, rateHz: 2_000_000, onTune: onTune) }
+private struct SpectrumView: View {
+    let values: [Float]; let centerHz: Double; let rateHz: Double; let onTune: (Double) -> Void
+    @Binding var zoom: CGFloat; @Binding var baseZoom: CGFloat
+    var body: some View {
+        GeometryReader { geo in
+            Path { path in
+                guard values.count > 1 else { return }
+                let lo: Float = -130; let hi: Float = -25
+                for i in values.indices {
+                    let rawX = (CGFloat(i) + 0.5) / CGFloat(values.count)
+                    let x = geo.size.width * (0.5 + (rawX - 0.5) * zoom)
+                    let y = geo.size.height * CGFloat(1 - (min(hi, max(lo, values[i])) - lo) / (hi - lo))
+                    if i == values.startIndex { path.move(to: CGPoint(x: x, y: y)) } else { path.addLine(to: CGPoint(x: x, y: y)) }
+                }
+            }
+            .stroke(.green, lineWidth: 1.5)
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0).onEnded { value in
+                let normalized = Double(value.location.x / max(1, geo.size.width)) - 0.5
+                onTune(centerHz + normalized * rateHz / Double(zoom))
+            })
+            .simultaneousGesture(MagnificationGesture().onChanged { value in zoom = min(16, max(1, baseZoom * value)) }.onEnded { _ in baseZoom = zoom })
+        }
+    }
 }
 
 private struct RadarView: View {
@@ -113,9 +155,8 @@ private struct RadarView: View {
 
 private struct WaterfallView: View {
     let rows: [[Float]]; let centerHz: Double; let rateHz: Double; let onTune: (Double) -> Void
-    init(rows: [[Float]], centerHz: Double, rateHz: Double, onTune: @escaping (Double) -> Void) { self.rows = rows; self.centerHz = centerHz; self.rateHz = rateHz; self.onTune = onTune }
-    init(rows: [[Float]], centerHz: Double, onTune: @escaping (Double) -> Void) { self.init(rows: rows, centerHz: centerHz, rateHz: 2_000_000, onTune: onTune) }
-    @State private var dragHz: Double?; @State private var zoom: CGFloat = 1; @State private var baseZoom: CGFloat = 1
+    init(rows: [[Float]], centerHz: Double, rateHz: Double, onTune: @escaping (Double) -> Void, zoom: Binding<CGFloat>, baseZoom: Binding<CGFloat>) { self.rows = rows; self.centerHz = centerHz; self.rateHz = rateHz; self.onTune = onTune; _zoom = zoom; _baseZoom = baseZoom }
+    @Binding var zoom: CGFloat; @Binding var baseZoom: CGFloat
     var body: some View {
         GeometryReader { geo in
             Canvas { context, size in
@@ -133,10 +174,10 @@ private struct WaterfallView: View {
             }
             .overlay(alignment: .topLeading) { Text("Waterfall").font(.caption).foregroundStyle(.white).padding(8).allowsHitTesting(false) }
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+            .gesture(DragGesture(minimumDistance: 0).onEnded { value in
                 let normalized = Double(value.location.x / max(1, geo.size.width)) - 0.5
-                dragHz = centerHz + normalized * rateHz / Double(zoom)
-            }.onEnded { _ in if let frequency = dragHz { onTune(frequency) }; dragHz = nil })
+                onTune(centerHz + normalized * rateHz / Double(zoom))
+            })
             .simultaneousGesture(MagnificationGesture().onChanged { value in zoom = min(16, max(1, baseZoom * value)) }.onEnded { _ in baseZoom = zoom })
         }
     }
@@ -151,9 +192,9 @@ private struct GroundTrackView: View {
     }.overlay(alignment: .topLeading) { Text("Trajetória terrestre").font(.caption).foregroundStyle(.white).padding(8) } }
 }
 
-private struct DecoderButton: View { let title: String; let key: String; let status: [String:Any]; let engine: SatHunterEngine; var active: Bool { status["on"] as? Bool ?? false }; var body: some View { Button { engine.decoder(key, on: !active) } label: { Label(title, systemImage: active ? "stop.circle.fill" : "play.circle").font(.caption) }.buttonStyle(.bordered).tint(active ? .green : .secondary) } }
+private struct DecoderButton: View { let title: String; let key: String; let status: [String:Any]; let engine: SDROutdoorEngine; var active: Bool { status["on"] as? Bool ?? false }; var body: some View { Button { engine.decoder(key, on: !active) } label: { Label(title, systemImage: active ? "stop.circle.fill" : "play.circle").font(.caption) }.buttonStyle(.bordered).tint(active ? .green : .secondary) } }
 
-private struct RecordButton: View { let engine: SatHunterEngine; let active: Bool; var body: some View { Button { engine.recording(!active) } label: { Label(active ? "Parar gravação" : "Gravar IQ", systemImage: active ? "stop.circle.fill" : "record.circle") }.buttonStyle(.bordered).tint(active ? .red : .secondary) } }
+private struct RecordButton: View { let engine: SDROutdoorEngine; let active: Bool; var body: some View { Button { engine.recording(!active) } label: { Label(active ? "Parar gravação" : "Gravar IQ", systemImage: active ? "stop.circle.fill" : "record.circle") }.buttonStyle(.bordered).tint(active ? .red : .secondary) } }
 
 private struct MapOverview: View {
     let latitude: Double
@@ -246,10 +287,12 @@ private struct FrequencyChangeOverlay: View {
 }
 
 private struct ReceiverScreenView: View {
-    @EnvironmentObject private var engine: SatHunterEngine
+    @EnvironmentObject private var engine: SDROutdoorEngine
     @Environment(\.dismiss) private var dismiss
     @State private var fullscreen = false
     @State private var changingFrequency = false
+    @State private var graphZoom: CGFloat = 1
+    @State private var graphBaseZoom: CGFloat = 1
     private func tuneFromGraph(_ value: Double) {
         engine.tune(value)
     }
@@ -286,22 +329,22 @@ private struct ReceiverScreenView: View {
                         Circle().fill(receivingIQ ? .green : running ? .orange : .red).frame(width: 10, height: 10)
                     }
                     Text("\(mode)  •  \(engine.status["source"] as? String ?? "sdrpp")").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-                    Text(engine.status["source_status"] as? String ?? "SDR++ desconectado")
+                    Text(engine.sdrppRequested ? (engine.status["source_status"] as? String ?? "Conectando ao SDR++") : "SDR++ desconectado")
                         .font(.caption2).foregroundStyle(receivingIQ ? .green : .orange).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
                     Text(String(format: "RF %.0f dB • Áudio %.3f • IQ descartado %@", engine.status["level_db"] as? Double ?? -120, engine.status["audio_rms"] as? Double ?? 0, String(engine.status["dropped"] as? Int ?? 0)))
                         .font(.caption2.monospacedDigit()).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                     Text("Buffer de áudio \(engine.status["audio_buffered_ms"] as? Int ?? 0) ms • falhas \(engine.status["audio_underruns"] as? Int ?? 0)")
                         .font(.caption2.monospacedDigit()).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                     HStack { Text("Heading \(String(format: "%.0f°", engine.heading))").font(.caption2.monospacedDigit()).foregroundStyle(.secondary); Spacer(); Button { fullscreen.toggle() } label: { Image(systemName: fullscreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }.buttonStyle(.plain).foregroundStyle(.blue).accessibilityLabel(fullscreen ? "Sair da tela cheia" : "Tela cheia") }
-                    ZStack { SpectrumView(values: engine.spectrum, centerHz: engine.spectrumCenterHz, rateHz: engine.spectrumRateHz) { tuneFromGraph($0) }; FrequencyScaleOverlay(centerHz: engine.spectrumCenterHz, mode: mode, rateHz: engine.spectrumRateHz, vfoHz: hz, bandwidthHz: engine.status["bw"] as? Double ?? 12_500).allowsHitTesting(false) }.frame(height: fullscreen ? 94 : 60)
-                    ZStack { WaterfallView(rows: engine.waterfall, centerHz: engine.spectrumCenterHz, rateHz: engine.spectrumRateHz) { tuneFromGraph($0) }; FrequencyScaleOverlay(centerHz: engine.spectrumCenterHz, mode: mode, rateHz: engine.spectrumRateHz, vfoHz: hz, bandwidthHz: engine.status["bw"] as? Double ?? 12_500, showScale: false).allowsHitTesting(false) }.frame(height: fullscreen ? 188 : 120).overlay { SatelliteMarkerOverlay(rows: engine.satelliteRows, centerHz: hz) { row in if let n = row["norad"] as? Int { engine.select(n) } }.allowsHitTesting(false) }
+                    ZStack { SpectrumView(values: engine.spectrum, centerHz: engine.spectrumCenterHz, rateHz: engine.spectrumRateHz, onTune: tuneFromGraph, zoom: $graphZoom, baseZoom: $graphBaseZoom); FrequencyScaleOverlay(centerHz: engine.spectrumCenterHz, mode: mode, rateHz: engine.spectrumRateHz, vfoHz: hz, bandwidthHz: engine.status["bw"] as? Double ?? (mode == "WFM" ? 180_000 : 12_500), zoom: graphZoom).allowsHitTesting(false) }.frame(height: fullscreen ? 94 : 60)
+                    ZStack { WaterfallView(rows: engine.waterfall, centerHz: engine.spectrumCenterHz, rateHz: engine.spectrumRateHz, onTune: tuneFromGraph, zoom: $graphZoom, baseZoom: $graphBaseZoom); FrequencyScaleOverlay(centerHz: engine.spectrumCenterHz, mode: mode, rateHz: engine.spectrumRateHz, vfoHz: hz, bandwidthHz: engine.status["bw"] as? Double ?? (mode == "WFM" ? 180_000 : 12_500), zoom: graphZoom, showScale: false).allowsHitTesting(false) }.frame(height: fullscreen ? 188 : 120).overlay { SatelliteMarkerOverlay(rows: engine.satelliteRows, centerHz: hz) { row in if let n = row["norad"] as? Int { engine.select(n) } }.allowsHitTesting(false) }
                     if !fullscreen {
                         RadarView(azimuth: look["az"] as? Double ?? 0, elevation: look["el"] as? Double ?? 0, heading: engine.heading).frame(height: 110).background(Color.black).clipShape(RoundedRectangle(cornerRadius: 10))
-                        HStack { Button("−") { engine.tune(hz - 12500) }; Button(running ? "Parar" : "Iniciar") { running ? engine.stop() : engine.start() }.buttonStyle(.borderedProminent); Button("+") { engine.tune(hz + 12500) } }
+                        HStack { Button("−") { engine.tune(hz - 12500) }; Button(running ? "Parar" : "Iniciar") { running ? engine.stop() : engine.start() }.buttonStyle(.borderedProminent).disabled(!running && !engine.sdrppRequested); Button("+") { engine.tune(hz + 12500) } }
                         HStack(spacing: 4) { ForEach(["NFM","WFM","AM","USB","LSB","CW"], id: \.self) { item in Button(item) { engine.setMode(item) }.buttonStyle(.borderedProminent).tint(item == mode ? .blue : .gray) } }.lineLimit(1)
                         HStack { Text("Filtro \(mode)").font(.caption); Slider(value: Binding(get: { engine.status["bw"] as? Double ?? bandwidthRange.lowerBound }, set: { engine.bandwidth($0) }), in: bandwidthRange); Text(String(format: mode == "CW" ? "%.0f Hz" : "%.1f kHz", mode == "CW" ? (engine.status["bw"] as? Double ?? 200) : (engine.status["bw"] as? Double ?? 12_500) / 1_000)).font(.caption.monospacedDigit()).frame(minWidth: 65) }
                     }
-                    HStack { Button("Vol −") { engine.changeVolume(-0.1) }; Text("Vol \(Int(engine.volume * 100))%").font(.caption.monospacedDigit()); Button("Vol +") { engine.changeVolume(0.1) }; RecordButton(engine: engine, active: engine.status["recording"] != nil) }
+                    HStack { Button("Vol −") { engine.changeVolume(-0.1) }; Text("Vol \(Int(engine.volume * 100))%").font(.caption.monospacedDigit()); Button("Vol +") { engine.changeVolume(0.1) }; RecordButton(engine: engine, active: engine.status["recording"] is [String: Any]) }
                     if let recording = engine.status["recording"] as? [String: Any] { Text(String(format: "REC %.0f s • %.1f MB • descartadas %@", recording["secs"] as? Double ?? 0, (recording["bytes"] as? Double ?? 0) / 1_000_000, String(recording["dropped"] as? Int ?? 0))).font(.caption2.monospacedDigit()).foregroundStyle(.red) }
                     HStack { DecoderButton(title: "APRS", key: "aprs", status: engine.status["aprs"] as? [String: Any] ?? [:], engine: engine); DecoderButton(title: "SSTV", key: "sstv", status: engine.status["sstv"] as? [String: Any] ?? [:], engine: engine); DecoderButton(title: "FSK 9k6", key: "fsk9k6", status: engine.status["fsk9k6"] as? [String: Any] ?? [:], engine: engine) }
                     DecoderSummaryPanel(status: engine.status, engine: engine)
@@ -316,18 +359,13 @@ private struct ReceiverScreenView: View {
                     .zIndex(1)
                 }
             }.navigationTitle(fullscreen ? "" : "SDR Outdoor").navigationBarTitleDisplayMode(.inline)
-                .onAppear {
-                    #if DEBUG
-                    if ProcessInfo.processInfo.arguments.contains("-ShowFrequencyEditor") { changingFrequency = true }
-                    #endif
-                }
         }
     }
 }
 
 private struct DecoderSummaryPanel: View {
     let status: [String: Any]
-    let engine: SatHunterEngine
+    let engine: SDROutdoorEngine
     private func decoder(_ key: String) -> [String: Any] { status[key] as? [String: Any] ?? [:] }
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {

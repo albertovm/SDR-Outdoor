@@ -1,8 +1,8 @@
 import SwiftUI
 
 @main
-struct SatHunterApp: App {
-    @StateObject private var engine = SatHunterEngine()
+struct SDROutdoorApp: App {
+    @StateObject private var engine = SDROutdoorEngine()
 
     var body: some Scene {
         WindowGroup {

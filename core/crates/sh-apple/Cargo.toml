@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 
 [lib]
-name = "sathunter_apple"
+name = "sdr_outdoor_apple"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]

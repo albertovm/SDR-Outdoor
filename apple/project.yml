@@ -1,19 +1,20 @@
-name: SatHunterApp
+name: SDROutdoorApp
 options:
   deploymentTarget:
     iOS: "18.0"
 targets:
-  SatHunterApp:
+  SDROutdoorApp:
     type: application
     platform: iOS
     sources:
-      - path: SatHunterApp
+      - path: SDROutdoorApp
     resources:
-      - path: SatHunterApp/Assets.xcassets
+      - path: SDROutdoorApp/Assets.xcassets
     info:
-      path: SatHunterApp/Info.plist
+      path: SDROutdoorApp/Info.plist
       properties:
         CFBundleDisplayName: SDR Outdoor
+        NSHumanReadableCopyright: Copyright © 2026 Alberto V M
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -30,5 +31,5 @@ targets:
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
     dependencies:
-      - framework: Frameworks/SatHunterCore.xcframework
+      - framework: Frameworks/SDROutdoorCore.xcframework
         embed: false

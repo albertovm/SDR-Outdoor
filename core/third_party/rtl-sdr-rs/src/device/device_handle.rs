@@ -44,7 +44,7 @@ impl DeviceHandle {
         })
     }
 
-    // SatHunterSDR patch: no enumeration on Android, only DeviceId::Fd works there
+    // SDR Outdoor patch: no enumeration on Android, only DeviceId::Fd works there
     #[cfg(target_os = "android")]
     fn open_from_usb(_selector: UsbSelector) -> Result<(Device, UsbStrings)> {
         Err(RtlsdrErr("Android: open the device with its file descriptor".to_string()))

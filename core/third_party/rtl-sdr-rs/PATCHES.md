@@ -1,4 +1,4 @@
-# Local changes (SatHunterSDR)
+# Local changes (SDR Outdoor)
 
 Vendored from rtl-sdr-rs 0.4.2 (https://github.com/ccostes/rtl-sdr-rs), MPL-2.0 (see LICENSE).
 

@@ -110,6 +110,6 @@ fn g3ruh_9k6_phone_discriminator() {
     // (77 frames sent). Stored as Vorbis q8, which costs some frames: 75 from the WAV, 66 from this.
     // With the SatNOGS-tuned settings alone the phone decoded half of them.
     let f = g3ruh("phone_fm_g3ruh9k6_114dBm.ogg");
-    let ok = f.iter().filter(|f| f.ax25.as_ref().is_some_and(|a| String::from_utf8_lossy(&a.info).contains("SatHunter 9k6 lab frame"))).count();
+    let ok = f.iter().filter(|f| f.ax25.as_ref().is_some_and(|a| String::from_utf8_lossy(&a.info).contains("9k6 lab frame"))).count();
     assert!(ok >= 60, "{ok} lab frames of {}", f.len());
 }

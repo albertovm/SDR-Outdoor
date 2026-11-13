@@ -5,7 +5,7 @@ audio (Ogg Vorbis, 48 kHz mono), cut to the part with the signal (`ffmpeg -ss ..
 SatNOGS observation data is published under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/);
 credit to the station owners named below. Tests: [tests/satnogs.rs](../../tests/satnogs.rs).
 
-| File | Observation | Satellite, downlink | Station | Cut (s from start) | What the station's own decoder got | SatHunterSDR |
+| File | Observation | Satellite, downlink | Station | Cut (s from start) | What the station's own decoder got | SDR Outdoor |
 |---|---|---|---|---|---|---|
 | `satnogs_15339570_iss_afsk1200.ogg` | [15339570](https://network.satnogs.org/observations/15339570/) | ISS, 437.825 MHz AFSK1200 | DB0RBX | 222-242 | the RS0ISS beacon | the beacon (only with the merged detectors) |
 | `satnogs_15372907_68795_afsk1200.ogg` | [15372907](https://network.satnogs.org/observations/15372907/) | NORAD 68795, 437.505 MHz AFSK1200 | JA1HCB-pi3 | 26-92 | 8 frames in this cut, 24 in the pass | 7 in this cut, 29 in the pass (5 with the discriminator alone) |
@@ -19,5 +19,5 @@ credit to the station owners named below. Tests: [tests/satnogs.rs](../../tests/
 Whole passes, 9k6 (unique frames, ours / station's, every one of ours also in the station's list): 57175 23 / 22,
 98914 28 / 29, 98193 5 / 26.
 
-Whole passes (not stored here): SatNOGS's decoder found 2 / 24 / 15 frames, SatHunterSDR 2 / 29 / 21, and every
+Whole passes (not stored here): SatNOGS's decoder found 2 / 24 / 15 frames, SDR Outdoor 2 / 29 / 21, and every
 frame SatNOGS found on ISS and PCSAT, 22 of its 24 on 68795.

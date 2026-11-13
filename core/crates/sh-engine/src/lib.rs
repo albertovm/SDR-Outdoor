@@ -1,4 +1,4 @@
-//! SatHunterSDR engine: owns the source, the DSP thread, the satellite tracker and the settings.
+//! SDR Outdoor engine: owns the source, the DSP thread, the satellite tracker and the settings.
 //! The UI (Android today, desktop later) talks to it with JSON commands and pulls spectrum rows
 //! and audio. Nothing in here panics on bad input; errors come back as {"ok": false, "error"}.
 
@@ -101,6 +101,8 @@ struct Inner {
     dsp_thread: Mutex<Option<JoinHandle<()>>>,
     dropped: Mutex<Option<Arc<AtomicU64>>>,
     running: AtomicBool,
+    /// Explicit SDR++ connection approval for this process only; never persisted.
+    sdrpp_authorized: AtomicBool,
     /// Decimation the running source applies (1 = none): the span is rate / decim
     decim: std::sync::atomic::AtomicUsize,
     /// Update requests (lab link / UI): the app reacts when the counter changes
@@ -275,6 +277,7 @@ impl Engine {
             dsp_thread: Mutex::new(None),
             dropped: Mutex::new(None),
             running: AtomicBool::new(false),
+            sdrpp_authorized: AtomicBool::new(false),
             decim: std::sync::atomic::AtomicUsize::new(1),
             update_req: Mutex::new((0, true)),
             aprs: Mutex::new(None),
@@ -389,6 +392,7 @@ fn run_cmd(i: &Arc<Inner>, c: Cmd) -> Result<Value, String> {
             Ok(json!({}))
         }
         Cmd::Stop => {
+            i.sdrpp_authorized.store(false, Ordering::SeqCst);
             stop(i);
             Ok(json!({}))
         }
@@ -756,6 +760,7 @@ fn run_cmd(i: &Arc<Inner>, c: Cmd) -> Result<Value, String> {
             let host = c.sdrpp_host.clone(); let port = c.sdrpp_port;
             drop(c);
             let _ = (host, port);
+            i.sdrpp_authorized.store(true, Ordering::SeqCst);
             switch_source(i, "sdrpp")?;
             Ok(json!({ "host": lock(&i.cfg).sdrpp_host, "port": lock(&i.cfg).sdrpp_port }))
         }
@@ -841,6 +846,9 @@ fn start(i: &Arc<Inner>) -> Result<(), String> {
         return Ok(());
     }
     let c = lock(&i.cfg).clone();
+    if c.source == "sdrpp" && !i.sdrpp_authorized.load(Ordering::SeqCst) {
+        return Err("connect to the SDR++ server in Settings first".into());
+    }
     let mut src = make_source(i, &c.source)?;
     let info = src.info();
     let rate = if info.sample_rates.contains(&c.rate) { c.rate } else { info.sample_rates[0] };
@@ -1097,7 +1105,7 @@ fn record_start(i: &Inner, dir: Option<String>, fd: Option<i32>, name: Option<St
     };
     let tx = selected_tx(i).map(|t| json!({ "description": t.description, "mode": t.mode, "downlink_low": t.down_low, "downlink_high": t.down_high }));
     let meta = json!({
-        "app": concat!("SatHunterSDR ", env!("CARGO_PKG_VERSION")),
+        "app": concat!("SDR Outdoor ", env!("CARGO_PKG_VERSION")),
         "start_unix": now_unix(),
         "sample_rate": rate,
         "center_hz": center,
@@ -1841,7 +1849,7 @@ mod tests {
     use super::*;
 
     fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("sathunter-test-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("sdr-outdoor-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("sat")).unwrap();
         d
@@ -1857,6 +1865,18 @@ mod tests {
 
     fn cmd(e: &Engine, j: &str) -> Value {
         serde_json::from_str(&e.command(j)).unwrap()
+    }
+
+    #[test]
+    fn sdrpp_stays_disconnected_until_explicit_configuration() {
+        let d = tmpdir("sdrpp-disconnected");
+        Config { source: "sdrpp".into(), update_days: 0.0, ..Config::default() }.save(&d.join("config.json"));
+        let e = Engine::new(&d);
+        assert_eq!(cmd(&e, r#"{"cmd":"status"}"#)["running"], false);
+        let start = cmd(&e, r#"{"cmd":"start"}"#);
+        assert_eq!(start["ok"], false);
+        assert!(start["error"].as_str().unwrap_or_default().contains("Settings"));
+        assert_eq!(cmd(&e, r#"{"cmd":"status"}"#)["running"], false);
     }
 
     #[test]

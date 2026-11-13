@@ -1,4 +1,4 @@
-//! SatHunterSDR signal processing: spectrum (FFT), channel extraction, demodulators, audio.
+//! SDR Outdoor signal processing: spectrum (FFT), channel extraction, demodulators, audio.
 //! Pure Rust, allocation-free in the steady state (buffers are reused).
 
 pub use rustfft::num_complex::Complex32;

@@ -1,6 +1,6 @@
 //! Demo source: behaves like an RTL-SDR (24-1766 MHz, RTL rates and gain steps, 8-bit samples,
 //! DC offset) and synthesises a small world: FM broadcast, airband AM, APRS bursts, a CW beacon,
-//! 433.92 MHz ISM bursts, a 70 cm repeater, and the satellite selected in the Cubesat Hunter at
+//! 433.92 MHz ISM bursts, a 70 cm repeater, and the satellite selected in SDR Outdoor at
 //! its real Doppler frequency. Lets the app run without hardware (classroom, screenshots).
 
 use crate::{
@@ -586,7 +586,7 @@ impl Drop for DemoSource {
     }
 }
 
-/// Shared slot for the satellite signal (Cubesat Hunter writes, demo source reads).
+/// Shared slot for the satellite signal (SDR Outdoor writes, demo source reads).
 pub fn sat_slot() -> SharedSatSignal {
     Arc::new(Mutex::new(None))
 }

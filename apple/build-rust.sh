@@ -3,6 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 CORE="$ROOT/core"
+TARGET_DIR="${CARGO_TARGET_DIR:-$CORE/target}"
 OUT="$ROOT/apple/Frameworks"
 CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
 
@@ -16,12 +17,12 @@ export CXXFLAGS_aarch64_apple_ios_sim="${CXXFLAGS_aarch64_apple_ios_sim:--mios-s
 "$CARGO" build --release --locked -p sh-apple --target aarch64-apple-ios-sim
 
 mkdir -p "$OUT"
-rm -rf "$OUT/SatHunterCore.xcframework"
+rm -rf "$OUT/SDROutdoorCore.xcframework"
 xcodebuild -create-xcframework \
-  -library "$CORE/target/aarch64-apple-ios/release/libsathunter_apple.a" \
+  -library "$TARGET_DIR/aarch64-apple-ios/release/libsdr_outdoor_apple.a" \
   -headers "$CORE/crates/sh-apple/include" \
-  -library "$CORE/target/aarch64-apple-ios-sim/release/libsathunter_apple.a" \
+  -library "$TARGET_DIR/aarch64-apple-ios-sim/release/libsdr_outdoor_apple.a" \
   -headers "$CORE/crates/sh-apple/include" \
-  -output "$OUT/SatHunterCore.xcframework"
+  -output "$OUT/SDROutdoorCore.xcframework"
 
-echo "Created $OUT/SatHunterCore.xcframework"
+echo "Created $OUT/SDROutdoorCore.xcframework"

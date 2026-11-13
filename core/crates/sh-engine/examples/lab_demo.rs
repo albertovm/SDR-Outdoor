@@ -6,7 +6,7 @@ use sh_engine::Engine;
 
 fn main() {
     let port: u16 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8765);
-    let dir = std::env::temp_dir().join("sathunter-lab-demo");
+    let dir = std::env::temp_dir().join("sdr-outdoor-lab-demo");
     std::fs::create_dir_all(dir.join("sat")).unwrap();
     Config { update_days: 0.0, fft_size: 8192, ..Config::default() }.save(&dir.join("config.json"));
     let e = Engine::new(&dir);

@@ -1,4 +1,4 @@
-module SatHunterCore {
-    header "SatHunterApple.h"
+module SDROutdoorCore {
+    header "SDROutdoorApple.h"
     export *
 }

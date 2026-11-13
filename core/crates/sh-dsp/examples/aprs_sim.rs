@@ -26,7 +26,7 @@ fn main() {
     // packets: audio at fs, FM to IQ
     let mut audio = Vec::new();
     for k in 0..n_pk {
-        let raw = Ax25Frame::ui("HG0LAB-1", "APRS", &["WIDE1-1"], format!("!4729.87N/01902.41E>SatHunter lab packet {k:02}").as_bytes());
+        let raw = Ax25Frame::ui("HG0LAB-1", "APRS", &["WIDE1-1"], format!("!4729.87N/01902.41E>SDR Outdoor lab packet {k:02}").as_bytes());
         audio.extend(afsk_audio(&hdlc_nrzi_bits(&raw, 40, 3), fs));
         audio.extend(vec![0.0f32; (0.2 * fs) as usize]);
     }
@@ -89,9 +89,9 @@ fn main() {
             d = AfskDecoder::with_params(AUDIO_RATE, prm);
         }
         d.process(&au);
-        let junk = d.frames.iter().filter(|f| !f.tnc2().starts_with("HG0LAB-1>APRS,WIDE1-1:!4729.87N/01902.41E>SatHunter lab packet")).count();
+        let junk = d.frames.iter().filter(|f| !f.tnc2().starts_with("HG0LAB-1>APRS,WIDE1-1:!4729.87N/01902.41E>SDR Outdoor lab packet")).count();
         if junk > 0 { eprintln!("C/N0 {cn0}: {junk} wrong frames"); }
-        let mut got: Vec<String> = d.frames.iter().map(|f| f.tnc2()).filter(|t| t.starts_with("HG0LAB-1>APRS,WIDE1-1:!4729.87N/01902.41E>SatHunter lab packet")).collect();
+        let mut got: Vec<String> = d.frames.iter().map(|f| f.tnc2()).filter(|t| t.starts_with("HG0LAB-1>APRS,WIDE1-1:!4729.87N/01902.41E>SDR Outdoor lab packet")).collect();
         got.sort();
         got.dedup();
         println!("C/N0 {cn0:4.1} dB-Hz: {:3.0} % ({} of {n_pk}, bad CRC {})", 100.0 * got.len() as f64 / n_pk as f64, got.len(), d.bad_crc);

@@ -27,7 +27,7 @@ pub enum AsyncReadConfigChange {
     CenterFrequency(u32),
     TunerGain(TunerGain),
     SampleRate(u32),
-    /// SatHunterSDR patch: bias tee (GPIO 0) on / off while streaming
+    /// SDR Outdoor patch: bias tee (GPIO 0) on / off while streaming
     BiasTee(bool),
 }
 

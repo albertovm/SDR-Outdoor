@@ -109,7 +109,7 @@ pub trait Source: Send {
     }
 }
 
-/// What the Cubesat Hunter says the selected satellite is sending right now (as received here,
+/// What SDR Outdoor says the selected satellite is sending right now (as received here,
 /// Doppler included). The demo source puts this signal on the air.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SatSignal {

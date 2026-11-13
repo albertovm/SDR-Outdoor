@@ -1,5 +1,5 @@
 import AVFoundation
-import SatHunterCore
+import SDROutdoorCore
 
 final class AudioOutput {
     private final class VolumeBox { var value: Float = 1 }
@@ -25,7 +25,7 @@ final class AudioOutput {
                 let destination = data.assumingMemoryBound(to: Float.self)
                 let capacity = Int(buffer.mDataByteSize) / MemoryLayout<Float>.stride
                 let requested = min(capacity, Int(frameCount))
-                let count = sh_apple_audio(destination, requested)
+                let count = sdr_outdoor_apple_audio(destination, requested)
                 for index in 0..<count { destination[index] *= volumeBox.value }
                 if count < capacity { for index in count..<capacity { destination[index] = 0 } }
             }

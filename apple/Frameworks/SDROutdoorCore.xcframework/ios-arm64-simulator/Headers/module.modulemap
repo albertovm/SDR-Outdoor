@@ -1,0 +1,4 @@
+module SDROutdoorCore {
+    header "SDROutdoorApple.h"
+    export *
+}

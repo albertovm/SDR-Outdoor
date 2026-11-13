@@ -7,25 +7,25 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		2042BB96F17D1D82B657BA43 /* SatHunterApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2367F9DB29C87E856FD39C97 /* SatHunterApp.swift */; };
+		2042BB96F17D1D82B657BA43 /* SDROutdoorApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2367F9DB29C87E856FD39C97 /* SDROutdoorApp.swift */; };
 		2864EA80FEAABCBA6F7035C1 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 279FD2B9604EB5EB22DB6851 /* ContentView.swift */; };
 		64B2F6268E40369B87452D72 /* LocationProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88EDACE4C0B8491106F8CA17 /* LocationProvider.swift */; };
-		69871FCCF56CB101B2399C03 /* SatHunterEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A118F9506AC148F01869D47 /* SatHunterEngine.swift */; };
+		69871FCCF56CB101B2399C03 /* SDROutdoorEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A118F9506AC148F01869D47 /* SDROutdoorEngine.swift */; };
 		76722B51EBF1F56168B8CD0E /* AudioOutput.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD52748089A5410658B7D0F4 /* AudioOutput.swift */; };
-		887DF8614467FB044EA34F49 /* SatHunterCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A8C5AE92C8CE24A35838C5CF /* SatHunterCore.xcframework */; };
+		887DF8614467FB044EA34F49 /* SDROutdoorCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A8C5AE92C8CE24A35838C5CF /* SDROutdoorCore.xcframework */; };
 		A73F4D6401EFF4A3774B7551 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 52E214637156398591D9593F /* Assets.xcassets */; };
-		BED27904C0AD2FD7026BE714 /* SatHunterLogo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C79EF9355C5059E34EDE149 /* SatHunterLogo.swift */; };
+		BED27904C0AD2FD7026BE714 /* SDROutdoorLogo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C79EF9355C5059E34EDE149 /* SDROutdoorLogo.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		1C79EF9355C5059E34EDE149 /* SatHunterLogo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SatHunterLogo.swift; sourceTree = "<group>"; };
-		217F22F798D174252ED2719B /* SatHunterApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = SatHunterApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		2367F9DB29C87E856FD39C97 /* SatHunterApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SatHunterApp.swift; sourceTree = "<group>"; };
+		1C79EF9355C5059E34EDE149 /* SDROutdoorLogo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SDROutdoorLogo.swift; sourceTree = "<group>"; };
+		217F22F798D174252ED2719B /* SDROutdoorApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = SDROutdoorApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		2367F9DB29C87E856FD39C97 /* SDROutdoorApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SDROutdoorApp.swift; sourceTree = "<group>"; };
 		279FD2B9604EB5EB22DB6851 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		4A118F9506AC148F01869D47 /* SatHunterEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SatHunterEngine.swift; sourceTree = "<group>"; };
+		4A118F9506AC148F01869D47 /* SDROutdoorEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SDROutdoorEngine.swift; sourceTree = "<group>"; };
 		52E214637156398591D9593F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		88EDACE4C0B8491106F8CA17 /* LocationProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationProvider.swift; sourceTree = "<group>"; };
-		A8C5AE92C8CE24A35838C5CF /* SatHunterCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = SatHunterCore.xcframework; path = Frameworks/SatHunterCore.xcframework; sourceTree = "<group>"; };
+		A8C5AE92C8CE24A35838C5CF /* SDROutdoorCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = SDROutdoorCore.xcframework; path = Frameworks/SDROutdoorCore.xcframework; sourceTree = "<group>"; };
 		B55AA8B9432E7759085E4031 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		FD52748089A5410658B7D0F4 /* AudioOutput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioOutput.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -35,14 +35,14 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				887DF8614467FB044EA34F49 /* SatHunterCore.xcframework in Frameworks */,
+				887DF8614467FB044EA34F49 /* SDROutdoorCore.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		3B22740B642DEE207C3511D1 /* SatHunterApp */ = {
+		3B22740B642DEE207C3511D1 /* SDROutdoorApp */ = {
 			isa = PBXGroup;
 			children = (
 				52E214637156398591D9593F /* Assets.xcassets */,
@@ -50,17 +50,17 @@
 				279FD2B9604EB5EB22DB6851 /* ContentView.swift */,
 				B55AA8B9432E7759085E4031 /* Info.plist */,
 				88EDACE4C0B8491106F8CA17 /* LocationProvider.swift */,
-				2367F9DB29C87E856FD39C97 /* SatHunterApp.swift */,
-				4A118F9506AC148F01869D47 /* SatHunterEngine.swift */,
-				1C79EF9355C5059E34EDE149 /* SatHunterLogo.swift */,
+				2367F9DB29C87E856FD39C97 /* SDROutdoorApp.swift */,
+				4A118F9506AC148F01869D47 /* SDROutdoorEngine.swift */,
+				1C79EF9355C5059E34EDE149 /* SDROutdoorLogo.swift */,
 			);
-			path = SatHunterApp;
+			path = SDROutdoorApp;
 			sourceTree = "<group>";
 		};
 		B4AE5FB21FFC6CC522839C9E /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				217F22F798D174252ED2719B /* SatHunterApp.app */,
+				217F22F798D174252ED2719B /* SDROutdoorApp.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -68,7 +68,7 @@
 		C016B558D3A2CB3AB2BC0BA0 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				A8C5AE92C8CE24A35838C5CF /* SatHunterCore.xcframework */,
+				A8C5AE92C8CE24A35838C5CF /* SDROutdoorCore.xcframework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -76,7 +76,7 @@
 		EFA5087E8115F6D71EF4353D = {
 			isa = PBXGroup;
 			children = (
-				3B22740B642DEE207C3511D1 /* SatHunterApp */,
+				3B22740B642DEE207C3511D1 /* SDROutdoorApp */,
 				C016B558D3A2CB3AB2BC0BA0 /* Frameworks */,
 				B4AE5FB21FFC6CC522839C9E /* Products */,
 			);
@@ -85,9 +85,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		E5A0B21A8B8E6124FE610E14 /* SatHunterApp */ = {
+		E5A0B21A8B8E6124FE610E14 /* SDROutdoorApp */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 1408CAEB4C705C08B8C26B96 /* Build configuration list for PBXNativeTarget "SatHunterApp" */;
+			buildConfigurationList = 1408CAEB4C705C08B8C26B96 /* Build configuration list for PBXNativeTarget "SDROutdoorApp" */;
 			buildPhases = (
 				03066872E99B1ECBEE79E274 /* Sources */,
 				7A811B176065CA9DEC035767 /* Resources */,
@@ -97,11 +97,11 @@
 			);
 			dependencies = (
 			);
-			name = SatHunterApp;
+			name = SDROutdoorApp;
 			packageProductDependencies = (
 			);
-			productName = SatHunterApp;
-			productReference = 217F22F798D174252ED2719B /* SatHunterApp.app */;
+			productName = SDROutdoorApp;
+			productReference = 217F22F798D174252ED2719B /* SDROutdoorApp.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -118,7 +118,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 90DE608226E49CFD47627688 /* Build configuration list for PBXProject "SatHunterApp" */;
+			buildConfigurationList = 90DE608226E49CFD47627688 /* Build configuration list for PBXProject "SDROutdoorApp" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -132,7 +132,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				E5A0B21A8B8E6124FE610E14 /* SatHunterApp */,
+				E5A0B21A8B8E6124FE610E14 /* SDROutdoorApp */,
 			);
 		};
 /* End PBXProject section */
@@ -156,9 +156,9 @@
 				76722B51EBF1F56168B8CD0E /* AudioOutput.swift in Sources */,
 				2864EA80FEAABCBA6F7035C1 /* ContentView.swift in Sources */,
 				64B2F6268E40369B87452D72 /* LocationProvider.swift in Sources */,
-				2042BB96F17D1D82B657BA43 /* SatHunterApp.swift in Sources */,
-				69871FCCF56CB101B2399C03 /* SatHunterEngine.swift in Sources */,
-				BED27904C0AD2FD7026BE714 /* SatHunterLogo.swift in Sources */,
+				2042BB96F17D1D82B657BA43 /* SDROutdoorApp.swift in Sources */,
+				69871FCCF56CB101B2399C03 /* SDROutdoorEngine.swift in Sources */,
+				BED27904C0AD2FD7026BE714 /* SDROutdoorLogo.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -177,7 +177,7 @@
 					"$(inherited)",
 					"\"Frameworks\"",
 				);
-				INFOPLIST_FILE = SatHunterApp/Info.plist;
+				INFOPLIST_FILE = SDROutdoorApp/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -322,7 +322,7 @@
 					"$(inherited)",
 					"\"Frameworks\"",
 				);
-				INFOPLIST_FILE = SatHunterApp/Info.plist;
+				INFOPLIST_FILE = SDROutdoorApp/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -339,7 +339,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		1408CAEB4C705C08B8C26B96 /* Build configuration list for PBXNativeTarget "SatHunterApp" */ = {
+		1408CAEB4C705C08B8C26B96 /* Build configuration list for PBXNativeTarget "SDROutdoorApp" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				E53FE938B99656DFA3DCD0D4 /* Debug */,
@@ -348,7 +348,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		90DE608226E49CFD47627688 /* Build configuration list for PBXProject "SatHunterApp" */ = {
+		90DE608226E49CFD47627688 /* Build configuration list for PBXProject "SDROutdoorApp" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				51EDFC9F4D6DD3AAE73E1D75 /* Debug */,
